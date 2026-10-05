@@ -127,7 +127,7 @@ class Client:
                             {'query': query}, params={'$top': top, 'timePrecision': 'true'})
 
     def hydrate(self, ids, as_of=None):
-        body = {'ids': ids, '$expand': 'All', 'errorPolicy': 'Fail'}
+        body = {'ids': ids, '$expand': 'all', 'errorPolicy': 'fail'}
         if as_of:
             body['asOf'] = as_of
         data = self.request('POST', self.project_route + '/_apis/wit/workitemsbatch', body)

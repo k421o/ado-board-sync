@@ -1,0 +1,184 @@
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from ado_board_sync.client import Client, SyncError
+from ado_board_sync.seed import PROCESSES, plan, seed
+from ado_board_sync.storage import current_snapshot
+from fake_ado import COLUMN, FakeADO, server
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+class SeedTests(unittest.TestCase):
+    def client(self, url):
+        return Client('orbit-lab', 'OrbitLab', 'invented-test-token', url)
+
+    def test_offline_plan_has_types_states_columns_personas_and_parents(self):
+        for process in PROCESSES:
+            with self.subTest(process=process):
+                planned = plan(process)
+                self.assertEqual(len(planned['cards']), 24)
+                seen = set()
+                for card in planned['cards']:
+                    if card['parent_key']:
+                        self.assertIn(card['parent_key'], seen)
+                    self.assertIn(card['assignee']['display_name'], ('Mira Fern', 'Oren Finch',
+                                                                    'Lena Vale', 'Tavi Moss'))
+                    seen.add(card['key'])
+                self.assertEqual(len({c['type'] for c in planned['cards']}), 3)
+                self.assertEqual({c['column'] for c in planned['cards'] if c['column']},
+                                 {'To Do', 'Doing', 'Done'})
+
+    def test_seed_creates_then_reconciles_and_syncs(self):
+        fake = FakeADO()
+        fake.items = {}
+        with server(fake) as (_, url):
+            result = seed(self.client(url))
+            self.assertEqual(result['created'], 24)
+            self.assertEqual(len(fake.items), 24)
+            planned = plan()['cards']
+            keyed = {c['key']: c['id'] for c in result['cards']}
+            for card in planned:
+                created = fake.items[keyed[card['key']]]
+                fields = created['fields']
+                self.assertIn(card['assignee']['display_name'], fields['System.Description'])
+                self.assertNotIn('System.AssignedTo', fields)
+                if card['parent_key']:
+                    self.assertTrue(created['relations'][0]['url'].endswith(
+                        '/' + str(keyed[card['parent_key']])))
+                if card['column']:
+                    self.assertEqual(fields[COLUMN], card['column'])
+            again = seed(self.client(url))
+            self.assertEqual(again['created'], 0)
+            self.assertEqual(again['cards'], result['cards'])
+            with tempfile.TemporaryDirectory() as directory:
+                from ado_board_sync.sync import sync
+                manifest = sync(self.client(url), directory)
+                self.assertEqual(manifest['card_count'],
+                                 sum(c['type'] == 'Issue' for c in planned))
+                cards = current_snapshot(Path(directory))[1]
+                self.assertTrue(all(c['parent_ids'] for c in cards.values()))
+
+    def test_ambiguous_creation_is_not_retried_and_resume_does_not_duplicate(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.ambiguous_create = True
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(len(fake.items), 1)
+            creates = [c for c in fake.calls if c[0] == 'POST' and '/workitems/$' in c[1]]
+            self.assertEqual(len(creates), 1)
+            result = seed(self.client(url))
+            self.assertEqual(result['created'], 23)
+            self.assertEqual(len(fake.items), 24)
+
+    def test_each_supported_process_seeds_against_its_board_mappings(self):
+        for process, (primary, states, task_states) in PROCESSES.items():
+            with self.subTest(process=process):
+                fake = FakeADO()
+                fake.items = {}
+                for col, state in zip(fake.board['columns'][:2] + fake.board['columns'][-1:], states):
+                    col['stateMappings'] = {primary: state}
+                fake.board['columns'][2]['stateMappings'] = {primary: states[1]}
+                epic_state = plan(process)['cards'][0]['state']
+                fake.types = [{'name': kind, 'states': [{'name': s} for s in state_names]}
+                              for kind, state_names in [('Epic', (epic_state,)),
+                                                        (primary, states), ('Task', task_states)]]
+                with server(fake) as (_, url):
+                    self.assertEqual(seed(self.client(url), process=process)['created'], 24)
+                    calls_before = len(fake.calls)
+                    self.assertEqual(seed(self.client(url), process=process)['created'], 0)
+                    self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                         for c in fake.calls[calls_before:]))
+
+    def test_patch_failure_after_create_can_resume(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.fail_path = '/workitems/102'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(len(fake.items), 3)
+            fake.fail_path = None
+            self.assertEqual(seed(self.client(url))['created'], 21)
+            self.assertEqual(len(fake.items), 24)
+
+    def test_seed_rejects_existing_work_and_process_mismatch_before_writes(self):
+        with server() as (fake, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertFalse(any('/workitems/$' in c[1] or c[0] == 'PATCH' for c in fake.calls))
+            fake.items = {}
+            with self.assertRaises(SyncError):
+                seed(self.client(url), process='Agile')
+            self.assertEqual(fake.items, {})
+
+    def test_edited_seed_and_different_size_refused(self):
+        fake = FakeADO()
+        fake.items = {}
+        with server(fake) as (_, url):
+            seed(self.client(url))
+            with self.assertRaises(SyncError):
+                seed(self.client(url), count=12)
+            fake.items[100]['fields']['System.Description'] = 'Edited fictional card'
+            calls_before = len(fake.calls)
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
+
+
+class CLITests(unittest.TestCase):
+    def run_cli(self, *args, cwd=None, authenticated=True):
+        env = dict(os.environ)
+        env.pop('ADO_PAT', None)
+        env.pop('AZURE_DEVOPS_EXT_PAT', None)
+        if authenticated:
+            env['ADO_PAT'] = 'invented-test-token'
+        return subprocess.run([str(REPO / 'ado-board-sync'), *args], cwd=cwd or REPO,
+                              env=env, capture_output=True, text=True, timeout=20)
+
+    def test_help_and_dry_run_without_auth_or_network(self):
+        result = self.run_cli('--help', authenticated=False)
+        self.assertEqual(result.returncode, 0)
+        result = self.run_cli('seed', '--organization', 'orbit-lab', '--project', 'OrbitLab',
+                              '--dry-run', authenticated=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['count'], 24)
+        from ado_board_sync.__main__ import main
+        with patch('ado_board_sync.__main__.credentials', side_effect=AssertionError('auth attempted')):
+            with patch('ado_board_sync.__main__.Client', side_effect=AssertionError('network attempted')):
+                with patch('builtins.print'):
+                    self.assertEqual(main(['seed', '--organization', 'orbit-lab', '--project',
+                                           'OrbitLab', '--dry-run']), 0)
+
+    def test_cli_sync_relative_output_from_another_directory_and_secret_errors(self):
+        with server() as (fake, url), tempfile.TemporaryDirectory() as directory:
+            args = ('sync', '--organization', 'orbit-lab', '--project', 'OrbitLab', '--base-url', url,
+                    '--output', 'local-cards')
+            result = self.run_cli(*args, cwd=directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)['card_count'], 3)
+            self.assertTrue((Path(directory) / 'local-cards' / 'current.json').exists())
+            pointer = (Path(directory) / 'local-cards' / 'current.json').read_bytes()
+            fake.fail_path, fake.fail_code = '/wiql', 401
+            failed = self.run_cli(*args, cwd=directory)
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn('token scopes', failed.stderr)
+            self.assertNotIn('invented-test-token', failed.stdout + failed.stderr)
+            self.assertEqual((Path(directory) / 'local-cards' / 'current.json').read_bytes(), pointer)
+            for file in (Path(directory) / 'local-cards').rglob('*.json'):
+                self.assertNotIn('invented-test-token', file.read_text())
+
+    def test_missing_auth_fails_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_cli('sync', '--organization', 'orbit-lab', '--project', 'OrbitLab',
+                                  '--output', 'local-cards', cwd=directory, authenticated=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse((Path(directory) / 'local-cards').exists())
