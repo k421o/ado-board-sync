@@ -36,6 +36,7 @@ class FakeADO:
         self.change_config_on_batch = False
         self.after_first_query = None
         self.ambiguous_create = False
+        self.ambiguous_patch = False
         self.invalid_json = False
         self.truncate_body = False
         self.query_mode = None
@@ -152,6 +153,9 @@ class FakeADO:
             for op in body:
                 target['fields'][op['path'].removeprefix('/fields/')] = op['value']
             target['rev'] += 1
+            if self.ambiguous_patch:
+                self.ambiguous_patch = False
+                return 503, {'message': 'placement committed but response lost'}, {}
             return 200, target, {}
         return 404, {'message': 'unknown fake route'}, {}
 

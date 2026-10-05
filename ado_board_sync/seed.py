@@ -5,7 +5,8 @@ import html
 from .board import configuration, read_items, resolve_board, values
 from .client import SyncError, segment
 
-MARKER = 'ado-board-sync-seed-v1'
+MARKER = 'ado-board-sync-seed-v2'
+PLACED_MARKER = 'ado-board-sync-seed-placed-v2'
 PROCESSES = {
     'Basic': ('Issue', ('To Do', 'Doing', 'Done'), ('To Do', 'Doing', 'Done')),
     'Agile': ('User Story', ('New', 'Active', 'Closed'), ('New', 'Active', 'Closed')),
@@ -101,6 +102,7 @@ def seed(client, process='Basic', count=24, team=None, board=None):
     existing, _ = read_items(client, query)
     keyed = {c['key']: c for c in planned['cards']}
     saved = {}
+    placed = set()
     for item in existing:
         fields = item.get('fields', {})
         matches = [c for c in keyed.values() if fields.get('System.Title') == c['title']]
@@ -108,7 +110,11 @@ def seed(client, process='Basic', count=24, team=None, board=None):
             raise SyncError('Seed requires an empty project or only this exact synthetic seed.')
         card = matches[0]
         tags = {tag.strip() for tag in fields.get('System.Tags', '').split(';')}
-        if (card['key'] in saved or tags != set(card['tags'])
+        expected_tags = set(card['tags'])
+        if card['column'] is not None and PLACED_MARKER in tags:
+            expected_tags.add(PLACED_MARKER)
+            placed.add(card['key'])
+        if (card['key'] in saved or tags != expected_tags
                 or fields.get('System.WorkItemType') != card['type']
                 or fields.get('System.Description') != description(card)
                 or fields.get('System.AssignedTo')):
@@ -127,6 +133,10 @@ def seed(client, process='Basic', count=24, team=None, board=None):
                 or fields.get('System.IterationPath') != config['backlog_iteration']['path']
                 or actual_parents != ([str(expected_parent)] if expected_parent else [])):
             raise SyncError('Synthetic seed cards were edited or have inconsistent parents; refusing writes.')
+        if key in placed:
+            column_field = config['board']['fields']['columnField']['referenceName']
+            if fields.get(column_field) != card['column']:
+                raise SyncError('Synthetic seed card placement was edited; refusing writes.')
     created = 0
     for card in planned['cards']:
         key = card['key']
@@ -154,14 +164,18 @@ def seed(client, process='Basic', count=24, team=None, board=None):
             created += 1
         if card['column'] is not None:
             column_field = config['board']['fields']['columnField']['referenceName']
-            if saved[key].get('fields', {}).get(column_field) == card['column']:
+            if key in placed:
                 continue
             item_id = saved[key]['id']
-            # Also repairs a run interrupted immediately after creation. All cards were
-            # validated as our own seed before any writes; this does not edit other cards.
+            # Record completion atomically with the initial placement. A lost response
+            # is recoverable, while later manual column moves are refused in preflight.
+            # Older seed versions have no completion proof and are rejected above.
             client.request('PATCH', client.project_route + '/_apis/wit/workitems/' + str(item_id),
                            [{'op': 'add', 'path': '/fields/' + column_field,
-                             'value': card['column']}], patch=True, retry=False)
+                             'value': card['column']},
+                            {'op': 'add', 'path': '/fields/System.Tags',
+                             'value': '; '.join(card['tags'] + [PLACED_MARKER])}],
+                           patch=True, retry=False)
     return {'created': created, 'total': len(saved), 'board': config['board']['name'],
             'cards': [{'key': c['key'], 'id': saved[c['key']]['id']} for c in planned['cards']],
             'assignee_policy': planned['assignee_policy']}

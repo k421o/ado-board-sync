@@ -1,13 +1,14 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from ado_board_sync.client import Client, SyncError
-from ado_board_sync.seed import PROCESSES, plan, seed
+from ado_board_sync.seed import PLACED_MARKER, PROCESSES, plan, seed
 from ado_board_sync.storage import current_snapshot
 from fake_ado import COLUMN, FakeADO, server
 
@@ -109,6 +110,49 @@ class SeedTests(unittest.TestCase):
             self.assertEqual(seed(self.client(url))['created'], 21)
             self.assertEqual(len(fake.items), 24)
 
+    def test_manual_move_between_columns_with_same_state_refused_before_writes(self):
+        fake = FakeADO()
+        fake.items = {}
+        with server(fake) as (_, url):
+            seed(self.client(url))
+            moved = next(i for i in fake.items.values() if i['fields'].get(COLUMN) == 'Doing')
+            self.assertIn(PLACED_MARKER, moved['fields']['System.Tags'].split('; '))
+            moved['fields'][COLUMN] = 'Review'
+            moved['rev'] += 1
+            calls_before = len(fake.calls)
+            with self.assertRaisesRegex(SyncError, 'placement was edited'):
+                seed(self.client(url))
+            self.assertEqual(moved['fields'][COLUMN], 'Review')
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
+
+    def test_lost_placement_response_resumes_without_repatching_completed_card(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.ambiguous_patch = True
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(len(fake.items), 3)
+            self.assertIn(PLACED_MARKER, fake.items[102]['fields']['System.Tags'].split('; '))
+            calls_before = len(fake.calls)
+            self.assertEqual(seed(self.client(url))['created'], 21)
+            self.assertFalse(any(c[0] == 'PATCH' and c[1].endswith('/workitems/102')
+                                 for c in fake.calls[calls_before:]))
+
+    def test_pending_card_with_initial_column_still_records_completed_placement(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.fail_path = '/workitems/102'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            pending = fake.items[102]
+            pending['fields'][COLUMN] = 'Done'
+            fake.fail_path = None
+            self.assertEqual(seed(self.client(url))['created'], 21)
+            self.assertIn(PLACED_MARKER, pending['fields']['System.Tags'].split('; '))
+
     def test_seed_rejects_existing_work_and_process_mismatch_before_writes(self):
         with server() as (fake, url):
             with self.assertRaises(SyncError):
@@ -153,8 +197,23 @@ class CLITests(unittest.TestCase):
         env.pop('AZURE_DEVOPS_EXT_PAT', None)
         if authenticated:
             env['ADO_PAT'] = 'invented-test-token'
-        return subprocess.run([str(REPO / 'ado-board-sync'), *args], cwd=cwd or REPO,
+        if sys.platform == 'win32':
+            env['PYTHONPATH'] = str(REPO) + (os.pathsep + env['PYTHONPATH']
+                                            if env.get('PYTHONPATH') else '')
+            entry = [sys.executable, '-m', 'ado_board_sync']
+        else:
+            entry = [str(REPO / 'ado-board-sync')]
+        return subprocess.run([*entry, *args], cwd=cwd or REPO,
                               env=env, capture_output=True, text=True, timeout=20)
+
+    def test_windows_entry_point_runs_sync_from_another_directory(self):
+        with server() as (_, url), tempfile.TemporaryDirectory() as directory:
+            with patch.object(sys, 'platform', 'win32'):
+                result = self.run_cli('sync', '--organization', 'orbit-lab', '--project', 'OrbitLab',
+                                      '--base-url', url, '--output', 'local-cards', cwd=directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)['card_count'], 3)
+            self.assertTrue((Path(directory) / 'local-cards' / 'current.json').exists())
 
     def test_help_and_dry_run_without_auth_or_network(self):
         result = self.run_cli('--help', authenticated=False)
