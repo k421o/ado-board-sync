@@ -37,6 +37,7 @@ class FakeADO:
         self.after_first_query = None
         self.ambiguous_create = False
         self.invalid_json = False
+        self.truncate_body = False
         self.query_mode = None
         self.next_id = 100
         self.board = {'id': 'orbit-board', 'name': 'Issues', 'isValid': True, 'revision': 1,
@@ -186,7 +187,7 @@ def server(fake=None):
             encoded = result if isinstance(result, bytes) else json.dumps(result).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(encoded)))
+            self.send_header('Content-Length', str(len(encoded) + (10 if fake.truncate_body else 0)))
             for key, value in headers.items():
                 self.send_header(key, value)
             self.end_headers()

@@ -53,14 +53,15 @@ class SyncTests(unittest.TestCase):
             pointer = (self.root / 'current.json').read_bytes()
             old_manifest, old_cards = current_snapshot(self.root)
             fake.items[1]['fields']['System.Title'] = 'Do not publish this partial change'
-            for failure in ('http', 'partial', 'settings', 'bad_json', 'bad_page'):
+            for failure in ('http', 'partial', 'settings', 'bad_json', 'bad_page', 'truncated'):
                 with self.subTest(failure=failure):
                     fake.fail_path = '/workitemsbatch' if failure == 'http' else None
                     fake.partial_batch = failure == 'partial'
                     fake.change_config_on_batch = failure == 'settings'
                     fake.invalid_json = failure == 'bad_json'
                     fake.query_mode = 'missing_time' if failure == 'bad_page' else None
-                    with self.assertRaises(SyncError):
+                    fake.truncate_body = failure == 'truncated'
+                    with patch('ado_board_sync.client.time.sleep'), self.assertRaises(SyncError):
                         sync(self.client(url), self.root)
                     self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
                     self.assertEqual(current_snapshot(self.root), (old_manifest, old_cards))

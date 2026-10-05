@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -112,7 +113,7 @@ class Client:
                         else ' Redirects are refused; check the organization.' if 300 <= code < 400
                         else '')
                 raise SyncError(f'ADO HTTP {code}.{hint}') from None
-            except (URLError, TimeoutError, ConnectionError, OSError):
+            except (URLError, TimeoutError, ConnectionError, OSError, HTTPException):
                 if retry and attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
