@@ -62,7 +62,7 @@ def plan(process='Basic', count=24):
                       'assignee': {'display_name': PERSONAS[index % len(PERSONAS)],
                                    'mode': 'fictional persona in description'},
                       'parent_key': parent, 'description': description,
-                      'tags': ['synthetic', MARKER, key]})
+                      'tags': ['synthetic', MARKER, key, f'orbit-seed-{process}-{count}']})
     return {'schema_version': 1, 'process': process, 'count': count, 'cards': cards,
             'assignee_policy': 'Invented personas are stored in descriptions. '
                                'ADO AssignedTo remains empty; no users are created.',
@@ -108,9 +108,10 @@ def seed(client, process='Basic', count=24, team=None, board=None):
             raise SyncError('Seed requires an empty project or only this exact synthetic seed.')
         card = matches[0]
         tags = {tag.strip() for tag in fields.get('System.Tags', '').split(';')}
-        if (card['key'] in saved or MARKER not in tags
+        if (card['key'] in saved or tags != set(card['tags'])
                 or fields.get('System.WorkItemType') != card['type']
-                or fields.get('System.Description') != description(card)):
+                or fields.get('System.Description') != description(card)
+                or fields.get('System.AssignedTo')):
             raise SyncError('Seed found unrelated, edited or duplicate cards; refusing writes.')
         saved[card['key']] = item
     for key, item in saved.items():

@@ -133,6 +133,18 @@ class SeedTests(unittest.TestCase):
             self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
                                  for c in fake.calls[calls_before:]))
 
+    def test_resume_with_larger_count_refused_before_writes(self):
+        fake = FakeADO()
+        fake.items = {}
+        with server(fake) as (_, url):
+            seed(self.client(url), count=12)
+            calls_before = len(fake.calls)
+            with self.assertRaises(SyncError):
+                seed(self.client(url), count=24)
+            self.assertEqual(len(fake.items), 12)
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
+
 
 class CLITests(unittest.TestCase):
     def run_cli(self, *args, cwd=None, authenticated=True):
