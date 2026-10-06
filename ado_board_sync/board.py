@@ -54,13 +54,31 @@ def configuration(client, route, board_id):
             raise ValueError()
         if not areas['values'] or any(not a['value'] for a in areas['values']):
             raise ValueError()
-        if not settings['backlogIteration']['path']:
+        iteration = settings['backlogIteration']
+        path = iteration['path']
+        if not isinstance(path, str):
             raise ValueError()
+        if not path or path.startswith('\\'):
+            # Team settings use project-relative paths, including '' for the root.
+            # Resolve the canonical project name even when --project is a GUID.
+            node_route = client.project_route + '/_apis/wit/classificationNodes/Iterations'
+            root = client.request('GET', node_route)
+            parts = path.lstrip('\\').split('\\') if path else []
+            if any(not part or part in {'.', '..'} for part in parts):
+                raise ValueError()
+            node = (client.request('GET', node_route + '/' + '/'.join(map(segment, parts)))
+                    if parts else root)
+            if (not isinstance(root.get('name'), str) or not root['name']
+                    or root.get('structureType') != 'iteration'
+                    or node.get('structureType') != 'iteration'
+                    or not iteration.get('id') or node.get('identifier') != iteration['id']):
+                raise ValueError()
+            iteration = {**iteration, 'path': '\\'.join([root['name'], *parts])}
     except (KeyError, TypeError, ValueError):
         raise SyncError('Board configuration is incomplete; refusing an unsafe export.') from None
     # Keep only membership/position configuration; unrelated settings need not abort a sync.
     return {'board': board, 'team_field_values': areas,
-            'backlog_iteration': settings['backlogIteration']}
+            'backlog_iteration': iteration}
 
 
 def membership_query(client, config):
@@ -79,8 +97,9 @@ def membership_query(client, config):
             + ' AND [System.IterationPath] UNDER ' + literal(config['backlog_iteration']['path']))
 
 
-def read_items(client, query, page_size=1000):
-    last_id, as_of, result = 0, None, []
+def item_batches(client, query, page_size=1000, *, after_id=0, as_of=None):
+    """Yield bounded batches at one server time; the ID cursor can resume a run."""
+    last_id = after_id
     while True:
         paged = query + f' AND [System.Id] > {last_id} ORDER BY [System.Id] ASC'
         if as_of:
@@ -104,22 +123,31 @@ def read_items(client, query, page_size=1000):
         except (KeyError, TypeError, ValueError, AttributeError):
             raise SyncError('Invalid or inconsistent WIQL page; refusing partial results.') from None
         as_of = server_time
+        if not ids:
+            yield [], as_of
         for start in range(0, len(ids), 200):
-            result.extend(client.hydrate(ids[start:start + 200], as_of))
+            yield client.hydrate(ids[start:start + 200], as_of), as_of
         if len(ids) < page_size:
-            return result, as_of
+            return
         last_id = ids[-1]
 
 
-def card_from_item(item, board):
+def read_items(client, query, page_size=1000):
+    result, as_of = [], None
+    for batch, as_of in item_batches(client, query, page_size):
+        result.extend(batch)
+    return result, as_of
+
+
+def card_from_item(item, board=None):
     fields = item.get('fields')
     if (not isinstance(fields, dict) or type(item.get('rev')) is not int
             or any(key not in fields for key in
                    ('System.Title', 'System.WorkItemType', 'System.State'))):
         raise SyncError('Incomplete card fields; refusing partial results.')
-    refs = {k: v['referenceName'] for k, v in board['fields'].items()}
-    column = fields.get(refs['columnField'])
-    if not column:
+    refs = {k: v['referenceName'] for k, v in board['fields'].items()} if board else {}
+    column = fields.get(refs.get('columnField'))
+    if board and not column:
         # A newly created card may not yet have a board-specific position field.
         matches = [c['name'] for c in board['columns']
                    if c['stateMappings'].get(fields['System.WorkItemType']) == fields['System.State']]
@@ -138,8 +166,8 @@ def card_from_item(item, board):
         'schema_version': SCHEMA_VERSION, 'id': item['id'], 'rev': item['rev'],
         'url': item.get('url'), 'title': fields['System.Title'],
         'type': fields['System.WorkItemType'], 'state': fields['System.State'],
-        'column': column, 'column_done': fields.get(refs['doneField'], False),
-        'lane': fields.get(refs['rowField'], ''), 'assignee': assigned,
+        'column': column, 'column_done': fields.get(refs['doneField'], False) if board else None,
+        'lane': fields.get(refs['rowField'], '') if board else None, 'assignee': assigned,
         'area_path': fields.get('System.AreaPath'),
         'iteration_path': fields.get('System.IterationPath'),
         'description': fields.get('System.Description', ''),

@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -74,6 +75,7 @@ class Client:
         self.organization, self.project = organization, project
         self.project_route = '/' + segment(project)
         self.timeout = timeout
+        self._not_before = 0
         self._pat = pat
         self._encoded = base64.b64encode((':' + pat).encode()).decode()
         handlers = [NoRedirect()]
@@ -82,6 +84,10 @@ class Client:
         self.opener = build_opener(*handlers)
 
     def request(self, method, route, body=None, *, params=None, patch=False, retry=True):
+        delay = self._not_before - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        self._not_before = 0
         url = self.root + route + '?' + urlencode({'api-version': '7.1', **(params or {})})
         data = None if body is None else json.dumps(body).encode('utf-8')
         for attempt in range(3):
@@ -96,6 +102,10 @@ class Client:
                     if response.headers.get('x-ms-continuationtoken'):
                         raise SyncError('Unexpected paginated response; previous snapshot retained.')
                     raw = response.read().decode('utf-8')
+                    header = response.headers.get('Retry-After')
+                    if header is not None:
+                        # ADO can throttle successful requests too; pace the next call.
+                        self._not_before = time.monotonic() + retry_delay(header, 0)
                 # Guard against an error/proxy response reflecting credentials into saved data.
                 raw = raw.replace(self._encoded, '[redacted]').replace(self._pat, '[redacted]')
                 value = json.loads(raw)
@@ -149,4 +159,4 @@ def retry_delay(header, attempt):
             delay = parsedate_to_datetime(header).timestamp() - time.time()
         except (ValueError, TypeError, OverflowError):
             delay = 2 ** attempt
-    return min(30, max(0, delay))
+    return max(0, delay) if math.isfinite(delay) else 2 ** attempt

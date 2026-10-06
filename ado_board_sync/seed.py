@@ -1,12 +1,14 @@
 """Invented sandbox cards, with server-side markers for interrupted-run recovery."""
 
 import html
+import re
 
 from .board import configuration, read_items, resolve_board, values
 from .client import SyncError, segment
 
 MARKER = 'ado-board-sync-seed-v2'
 PLACED_MARKER = 'ado-board-sync-seed-placed-v2'
+PENDING_STATE_MARKER = 'ado-board-sync-seed-pending-state-v2'
 PROCESSES = {
     'Basic': ('Issue', ('To Do', 'Doing', 'Done'), ('To Do', 'Doing', 'Done')),
     'Agile': ('User Story', ('New', 'Active', 'Closed'), ('New', 'Active', 'Closed')),
@@ -77,6 +79,12 @@ def description(card):
             + html.escape(card['assignee']['display_name']) + ' (fictional persona).</p>')
 
 
+def normalized_description(value):
+    # ADO's HTML sanitizer inserts trailing whitespace inside paragraphs.
+    # Preserve markup and content so actual edits still prevent recovery writes.
+    return re.sub(r'\s+</p>', '</p>', value) if isinstance(value, str) else None
+
+
 def seed(client, process='Basic', count=24, team=None, board=None):
     planned = plan(process, count)
     route, board_id = resolve_board(client, team, board)
@@ -92,17 +100,26 @@ def seed(client, process='Basic', count=24, team=None, board=None):
         stage_columns.append(matches[0])
     types = values(client.request('GET', client.project_route + '/_apis/wit/workitemtypes'))
     available = {t['name']: {s['name'] for s in t.get('states', [])} for t in types}
+    transitions = {t['name']: t.get('transitions', {}) for t in types}
     for card in planned['cards']:
         if card['type'] == primary:
             column = stage_columns[card['stage']]
             card['column'], card['state'] = column['name'], column['stateMappings'][primary]
         if card['state'] not in available.get(card['type'], set()):
             raise SyncError('Project work item types/states do not match --process; no cards created.')
+        initial = transitions[card['type']].get('', [])
+        card['initial_state'] = initial[0]['to'] if initial else card['state']
+        if (card['initial_state'] not in available[card['type']]
+                or (card['initial_state'] != card['state'] and not any(
+                    t.get('to') == card['state']
+                    for t in transitions[card['type']].get(card['initial_state'], [])))):
+            raise SyncError('Project cannot transition synthetic cards to their planned states.')
     query = 'SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project'
     existing, _ = read_items(client, query)
     keyed = {c['key']: c for c in planned['cards']}
     saved = {}
     placed = set()
+    pending_state = set()
     for item in existing:
         fields = item.get('fields', {})
         matches = [c for c in keyed.values() if fields.get('System.Title') == c['title']]
@@ -111,12 +128,16 @@ def seed(client, process='Basic', count=24, team=None, board=None):
         card = matches[0]
         tags = {tag.strip() for tag in fields.get('System.Tags', '').split(';')}
         expected_tags = set(card['tags'])
+        if PENDING_STATE_MARKER in tags and card['initial_state'] != card['state']:
+            expected_tags.add(PENDING_STATE_MARKER)
+            pending_state.add(card['key'])
         if card['column'] is not None and PLACED_MARKER in tags:
             expected_tags.add(PLACED_MARKER)
             placed.add(card['key'])
         if (card['key'] in saved or tags != expected_tags
+                or (card['key'] in pending_state and card['key'] in placed)
                 or fields.get('System.WorkItemType') != card['type']
-                or fields.get('System.Description') != description(card)
+                or normalized_description(fields.get('System.Description')) != description(card)
                 or fields.get('System.AssignedTo')):
             raise SyncError('Seed found unrelated, edited or duplicate cards; refusing writes.')
         saved[card['key']] = item
@@ -130,7 +151,8 @@ def seed(client, process='Basic', count=24, team=None, board=None):
         actual_parents = [r.get('url', '').rsplit('/', 1)[-1]
                           for r in item.get('relations', [])
                           if r.get('rel') == 'System.LinkTypes.Hierarchy-Reverse']
-        if (fields.get('System.State') != card['state']
+        expected_state = card['initial_state'] if key in pending_state else card['state']
+        if (fields.get('System.State') != expected_state
                 or fields.get('System.AreaPath') != config['team_field_values']['defaultValue']
                 or fields.get('System.IterationPath') != config['backlog_iteration']['path']
                 or actual_parents != ([str(expected_parent)] if expected_parent else [])):
@@ -138,6 +160,10 @@ def seed(client, process='Basic', count=24, team=None, board=None):
         if card['column'] is not None:
             column_field = config['board']['fields']['columnField']['referenceName']
             allowed_columns = {card['column']} if key in placed else {None, '', card['column']}
+            if key in pending_state:
+                initial_columns = [c['name'] for c in columns
+                                   if c['stateMappings'].get(card['type']) == card['initial_state']]
+                allowed_columns = {None, '', initial_columns[0] if initial_columns else None}
             if fields.get(column_field) not in allowed_columns:
                 raise SyncError('Synthetic seed card placement was edited; refusing writes.')
     created = 0
@@ -146,11 +172,14 @@ def seed(client, process='Basic', count=24, team=None, board=None):
         parent_key = card['parent_key']
         parent_id = saved[parent_key]['id'] if parent_key else None
         if key not in saved:
-            fields = {'System.Title': card['title'], 'System.State': card['state'],
+            if card['initial_state'] != card['state']:
+                pending_state.add(key)
+            tags = card['tags'] + ([PENDING_STATE_MARKER] if key in pending_state else [])
+            fields = {'System.Title': card['title'], 'System.State': card['initial_state'],
                       'System.Description': description(card),
                       'System.AreaPath': config['team_field_values']['defaultValue'],
                       'System.IterationPath': config['backlog_iteration']['path'],
-                      'System.Tags': '; '.join(card['tags'])}
+                      'System.Tags': '; '.join(tags)}
             body = [{'op': 'add', 'path': '/fields/' + field, 'value': value}
                     for field, value in fields.items()]
             if parent_id:
@@ -166,20 +195,22 @@ def seed(client, process='Basic', count=24, team=None, board=None):
                 raise SyncError('Seed create response was incomplete; rerun the same command.')
             saved[key] = item
             created += 1
-        if card['column'] is not None:
-            column_field = config['board']['fields']['columnField']['referenceName']
+        if card['column'] is not None or key in pending_state:
             if key in placed:
                 continue
             item_id = saved[key]['id']
             # Record completion atomically with the initial placement. A lost response
             # is recoverable, while later manual column moves are refused in preflight.
             # Older seed versions have no completion proof and are rejected above.
-            client.request('PATCH', client.project_route + '/_apis/wit/workitems/' + str(item_id),
-                           [{'op': 'test', 'path': '/rev', 'value': saved[key]['rev']},
-                            {'op': 'add', 'path': '/fields/' + column_field,
-                             'value': card['column']},
-                            {'op': 'add', 'path': '/fields/System.Tags',
-                             'value': '; '.join(card['tags'] + [PLACED_MARKER])}],
+            body = [{'op': 'test', 'path': '/rev', 'value': saved[key]['rev']}]
+            if key in pending_state:
+                body.append({'op': 'add', 'path': '/fields/System.State', 'value': card['state']})
+            if card['column'] is not None:
+                column_field = config['board']['fields']['columnField']['referenceName']
+                body.append({'op': 'add', 'path': '/fields/' + column_field, 'value': card['column']})
+            final_tags = card['tags'] + ([PLACED_MARKER] if card['column'] is not None else [])
+            body.append({'op': 'replace', 'path': '/fields/System.Tags', 'value': '; '.join(final_tags)})
+            client.request('PATCH', client.project_route + '/_apis/wit/workitems/' + str(item_id), body,
                            patch=True, retry=False)
     return {'created': created, 'total': len(saved), 'board': config['board']['name'],
             'cards': [{'key': c['key'], 'id': saved[c['key']]['id']} for c in planned['cards']],

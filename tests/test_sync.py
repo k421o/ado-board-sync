@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ado_board_sync.board import membership_query, read_items
+from ado_board_sync.board import configuration, membership_query, read_items
 from ado_board_sync.client import Client, SyncError
 from ado_board_sync.storage import current_snapshot, locked_folder
 from ado_board_sync.sync import sync
@@ -22,7 +22,7 @@ class SyncTests(unittest.TestCase):
 
     def test_first_sync_and_second_sync_edit_move_add_remove(self):
         with server() as (fake, url):
-            manifest = sync(self.client(url), self.root)
+            manifest = sync(self.client(url), self.root, scope='board')
             self.assertEqual(manifest['card_ids'], [1, 2, 3])
             first_pointer = json.loads((self.root / 'current.json').read_text())
             first_folder = self.root / first_pointer['snapshot']
@@ -33,7 +33,7 @@ class SyncTests(unittest.TestCase):
             fake.items[2]['rev'] += 1
             fake.items[4] = item(4, column='To Do', state='To Do')
             del fake.items[3]
-            second = sync(self.client(url), self.root)
+            second = sync(self.client(url), self.root, scope='board')
             self.assertEqual(second['changes'], {'added': [4], 'updated': [1, 2],
                                                   'moved': [2], 'removed': [3], 'unchanged': 0})
             _, cards = current_snapshot(self.root)
@@ -42,14 +42,40 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(cards[2]['state'], 'Doing')
             self.assertNotIn(3, cards)
             self.assertTrue((first_folder / 'cards' / '3.json').exists())
-            third = sync(self.client(url), self.root)
+            third = sync(self.client(url), self.root, scope='board')
             self.assertEqual(third['changes']['unchanged'], 3)
             self.assertFalse(third['changes']['updated'])
             self.assertTrue(all(call[0] != 'PATCH' for call in fake.calls))
 
+    def test_project_relative_backlog_iteration_paths(self):
+        with server() as (fake, url):
+            fake.settings['backlogIteration']['path'] = ''
+            manifest = sync(self.client(url), self.root, scope='board')
+            self.assertEqual(manifest['card_ids'], [1, 2, 3])
+            fake.settings['backlogIteration'] = {'id': 'nested-iteration',
+                                                 'path': '\\Release One\\Sprint 1'}
+            fake.iteration_nodes['Release One/Sprint 1'] = {
+                'identifier': 'nested-iteration', 'name': 'Sprint 1',
+                'structureType': 'iteration'}
+            client = Client('orbit-lab', 'synthetic-project-id', 'invented-test-token', url)
+            config = configuration(client, '/OrbitLab/orbit-team/_apis/work', 'orbit-board')
+            self.assertEqual(config['backlog_iteration']['path'],
+                             'OrbitLab\\Release One\\Sprint 1')
+            self.assertIn("UNDER 'OrbitLab\\Release One\\Sprint 1'", membership_query(client, config))
+
+    def test_changed_iteration_identity_preserves_snapshot(self):
+        with server() as (fake, url):
+            sync(self.client(url), self.root, scope='board')
+            pointer = (self.root / 'current.json').read_bytes()
+            fake.settings['backlogIteration']['path'] = ''
+            fake.iteration_nodes['']['identifier'] = 'different-iteration'
+            with self.assertRaises(SyncError):
+                sync(self.client(url), self.root, scope='board')
+            self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+
     def test_failed_partial_or_changed_config_retains_previous_snapshot(self):
         with server() as (fake, url):
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             pointer = (self.root / 'current.json').read_bytes()
             old_manifest, old_cards = current_snapshot(self.root)
             fake.items[1]['fields']['System.Title'] = 'Do not publish this partial change'
@@ -62,14 +88,14 @@ class SyncTests(unittest.TestCase):
                     fake.query_mode = 'missing_time' if failure == 'bad_page' else None
                     fake.truncate_body = failure == 'truncated'
                     with patch('ado_board_sync.client.time.sleep'), self.assertRaises(SyncError):
-                        sync(self.client(url), self.root)
+                        sync(self.client(url), self.root, scope='board')
                     self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
                     self.assertEqual(current_snapshot(self.root), (old_manifest, old_cards))
                     self.assertFalse((self.root / '.sync-lock').exists())
 
     def test_disk_write_failure_retains_previous_snapshot(self):
         with server() as (_, url):
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             pointer = (self.root / 'current.json').read_bytes()
             from ado_board_sync.storage import write_json
 
@@ -78,20 +104,28 @@ class SyncTests(unittest.TestCase):
                     raise OSError('invented disk full')
                 write_json(path, data)
 
-            with patch('ado_board_sync.storage.write_json', side_effect=fail_card):
+            with patch('ado_board_sync.export.write_json', side_effect=fail_card):
                 with self.assertRaises(OSError):
-                    sync(self.client(url), self.root)
+                    sync(self.client(url), self.root, scope='board')
             self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
             self.assertEqual(len(current_snapshot(self.root)[1]), 3)
             self.assertFalse(list((self.root / 'snapshots').glob('.tmp-*')))
 
     def test_publish_pointer_failure_retains_previous_snapshot(self):
+        import os
+        replace = os.replace
+
+        def fail_pointer(source, destination):
+            if destination.name == 'current.json':
+                raise OSError('invented failure')
+            return replace(source, destination)
+
         with server() as (_, url):
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             pointer = (self.root / 'current.json').read_bytes()
-            with patch('ado_board_sync.storage.os.replace', side_effect=OSError('invented failure')):
+            with patch('ado_board_sync.export.os.replace', side_effect=fail_pointer):
                 with self.assertRaises(OSError):
-                    sync(self.client(url), self.root)
+                    sync(self.client(url), self.root, scope='board')
             self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
             self.assertEqual(len(current_snapshot(self.root)[1]), 3)
 
@@ -106,7 +140,7 @@ class SyncTests(unittest.TestCase):
 
         fake.after_first_query = edit_live
         with server(fake) as (_, url):
-            manifest = sync(self.client(url), self.root)
+            manifest = sync(self.client(url), self.root, scope='board')
             self.assertEqual(manifest['card_count'], 1003)
             cards = current_snapshot(self.root)[1]
             self.assertEqual(cards[1003]['title'], 'Observe a fictional nebula')
@@ -124,24 +158,24 @@ class SyncTests(unittest.TestCase):
         with server(fake) as (_, url):
             fake.partial_batch = True
             with self.assertRaises(SyncError):
-                sync(self.client(url), self.root)
+                sync(self.client(url), self.root, scope='board')
             self.assertFalse((self.root / 'current.json').exists())
             fake.partial_batch = False
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             old = current_snapshot(self.root)
             fake.items = {i: item(i) for i in range(1, 405)}
             fake.fail_batch = fake.batch_calls + 2
             with self.assertRaises(SyncError):
-                sync(self.client(url), self.root)
+                sync(self.client(url), self.root, scope='board')
             self.assertEqual(current_snapshot(self.root), old)
 
     def test_empty_board_and_scope_removals(self):
         with server() as (fake, url):
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             fake.items[1]['fields']['System.State'] = 'Removed'
             fake.items[2]['fields']['System.AreaPath'] = 'OtherLab'
             fake.items[3]['fields']['System.IterationPath'] = 'OtherLab'
-            manifest = sync(self.client(url), self.root)
+            manifest = sync(self.client(url), self.root, scope='board')
             self.assertEqual(manifest['changes']['removed'], [1, 2, 3])
             self.assertEqual(current_snapshot(self.root)[1], {})
 
@@ -155,9 +189,9 @@ class SyncTests(unittest.TestCase):
             with self.assertRaises(SyncError), locked_folder(self.root):
                 pass
         with server() as (_, url):
-            sync(self.client(url), self.root)
+            sync(self.client(url), self.root, scope='board')
             with self.assertRaises(SyncError):
-                sync(self.client(url), self.root, team='other-team')
+                sync(self.client(url), self.root, team='other-team', scope='board')
 
     def test_invalid_query_results_abort(self):
         with server() as (fake, url):

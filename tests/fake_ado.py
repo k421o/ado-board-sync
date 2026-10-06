@@ -41,6 +41,7 @@ class FakeADO:
         self.invalid_json = False
         self.truncate_body = False
         self.query_mode = None
+        self.response_headers = {}
         self.next_id = 100
         self.board = {'id': 'orbit-board', 'name': 'Issues', 'isValid': True, 'revision': 1,
                       'fields': {'columnField': {'referenceName': COLUMN},
@@ -56,6 +57,8 @@ class FakeADO:
         self.areas = {'field': {'referenceName': 'System.AreaPath'}, 'defaultValue': 'OrbitLab',
                       'values': [{'value': 'OrbitLab', 'includeChildren': True}]}
         self.settings = {'backlogIteration': {'id': 'orbit-iteration', 'path': 'OrbitLab'}}
+        self.iteration_nodes = {'': {'identifier': 'orbit-iteration', 'name': 'OrbitLab',
+                                     'structureType': 'iteration'}}
         self.types = [{'name': kind, 'states': [{'name': state} for state in ('To Do', 'Doing', 'Done')]}
                       for kind in ('Epic', 'Issue', 'Task')]
 
@@ -67,6 +70,10 @@ class FakeADO:
         if self.invalid_json:
             return 200, b'not json invented-test-token', {}
         if method == 'GET':
+            if '/_apis/wit/classificationNodes/Iterations' in path:
+                relative = path.split('/classificationNodes/Iterations', 1)[1].lstrip('/')
+                node = self.iteration_nodes.get(relative)
+                return (200, node, {}) if node else (404, {'message': 'Unknown iteration'}, {})
             if '/_apis/projects/' in path:
                 return 200, {'defaultTeam': {'id': 'orbit-team'}}, {}
             if path.endswith('/boards'):
@@ -136,6 +143,9 @@ class FakeADO:
                       for op in body if op['path'].startswith('/fields/')}
             states = next(t['states'] for t in self.types if t['name'] == kind)
             assert fields['System.State'] in {s['name'] for s in states}
+            transitions = next(t.get('transitions', {}) for t in self.types if t['name'] == kind)
+            if transitions.get('') and fields['System.State'] not in {t['to'] for t in transitions['']}:
+                return 400, {'message': 'State cannot be used at creation'}, {}
             assert 'System.AssignedTo' not in fields  # invented personas are not ADO identities
             relations = [op['value'] for op in body if op['path'] == '/relations/-']
             for relation in relations:
@@ -167,8 +177,13 @@ class FakeADO:
                         return 400, {'message': 'unsupported test path'}, {}
                     if actual != op['value']:
                         return 412, {'message': 'patch precondition failed'}, {}
-                elif op['op'] == 'add' and op['path'].startswith('/fields/'):
-                    target['fields'][op['path'].removeprefix('/fields/')] = op['value']
+                elif op['op'] in {'add', 'replace'} and op['path'].startswith('/fields/'):
+                    field = op['path'].removeprefix('/fields/')
+                    if field == 'System.Tags' and op['op'] == 'add':
+                        tags = target['fields'].get(field, '').split(';') + op['value'].split(';')
+                        target['fields'][field] = '; '.join(sorted({t.strip() for t in tags if t.strip()}))
+                    else:
+                        target['fields'][field] = op['value']
                 else:
                     return 400, {'message': 'unsupported patch operation'}, {}
             target['rev'] += 1
@@ -212,7 +227,7 @@ def server(fake=None):
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(encoded) + (10 if fake.truncate_body else 0)))
-            for key, value in headers.items():
+            for key, value in {**fake.response_headers, **headers}.items():
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(encoded)

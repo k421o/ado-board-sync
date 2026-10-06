@@ -3,10 +3,9 @@
 import json
 import os
 import re
-import shutil
-import uuid
+import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import SCHEMA_VERSION
@@ -37,6 +36,29 @@ def sync_directory(path):
             os.close(descriptor)
 
 
+def ignore_export(root):
+    """Exclude all generated data, even in a custom output folder inside a repo."""
+    path = root / '.gitignore'
+    contents = '# Generated ADO data may contain private work items.\n*\n'
+    if path.is_symlink():
+        raise SyncError('Export .gitignore must not be a symlink.')
+    if path.exists() and path.read_text(encoding='utf-8') == contents:
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                         prefix='.gitignore-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(root)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 @contextmanager
 def locked_folder(output):
     root = Path(output).absolute()
@@ -58,6 +80,7 @@ def locked_folder(output):
             write_json(marker, {'schema_version': SCHEMA_VERSION})
         elif load_json(marker) != {'schema_version': SCHEMA_VERSION}:
             raise SyncError('Unsupported snapshot folder format.')
+        ignore_export(root)
         snapshots = root / 'snapshots'
         if snapshots.is_symlink():
             raise SyncError('Snapshots directory must not be a symlink.')
@@ -67,11 +90,32 @@ def locked_folder(output):
         lock.unlink()
 
 
-def current_snapshot(root):
+class SnapshotCards(Mapping):
+    """Read one previous card at a time instead of retaining its contents."""
+
+    def __init__(self, folder, ids):
+        self.folder, self.ids = folder, set(ids)
+
+    def __iter__(self):
+        return iter(self.ids)
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, item_id):
+        if item_id not in self.ids:
+            raise KeyError(item_id)
+        return load_json(self.folder / f"{item_id}.json")
+
+
+def current_snapshot(root, *, lazy=False, snapshot=None):
     pointer = root / 'current.json'
-    if not pointer.exists():
-        return None, {}
-    data = load_json(pointer)
+    if snapshot is None:
+        if not pointer.exists():
+            return None, {}
+        data = load_json(pointer)
+    else:
+        data = {'schema_version': SCHEMA_VERSION, 'snapshot': snapshot}
     snapshot = data.get('snapshot', '')
     if (data.get('schema_version') != SCHEMA_VERSION or not isinstance(snapshot, str)
             or not re.fullmatch(r'snapshots/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}', snapshot)):
@@ -84,48 +128,9 @@ def current_snapshot(root):
             or not isinstance(manifest.get('card_ids'), list)
             or manifest.get('card_count') != len(manifest['card_ids'])):
         raise SyncError('Invalid local snapshot manifest.')
-    cards = {}
-    for item_id in manifest['card_ids']:
-        if type(item_id) is not int or item_id <= 0:
-            raise SyncError('Invalid local card ID.')
-        cards[item_id] = load_json(path / 'cards' / f'{item_id}.json')
-    return manifest, cards
-
-
-def publish(root, source, config, cards, as_of, previous):
-    generation = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex
-    staging = root / 'snapshots' / ('.tmp-' + generation)
-    destination = root / 'snapshots' / generation
-    pointer = root / ('.current-' + generation)
-    new = {card['id']: card for card in cards}
-    changed = sorted(i for i in new.keys() & previous.keys() if new[i] != previous[i])
-    changes = {'added': sorted(new.keys() - previous.keys()), 'updated': changed,
-               'moved': [i for i in changed if any(new[i][key] != previous[i][key]
-                                                   for key in ('column', 'column_done', 'lane'))],
-               'removed': sorted(previous.keys() - new.keys()),
-               'unchanged': len(new.keys() & previous.keys()) - len(changed)}
-    manifest = {'schema_version': SCHEMA_VERSION, 'source': source, 'as_of': as_of,
-                'synced_at': datetime.now(timezone.utc).isoformat(),
-                'card_ids': sorted(new), 'card_count': len(new), 'changes': changes,
-                'configuration': config}
-    try:
-        (staging / 'cards').mkdir(parents=True)
-        for item_id, card in new.items():
-            write_json(staging / 'cards' / f'{item_id}.json', card)
-        write_json(staging / 'manifest.json', manifest)
-        sync_directory(staging / 'cards')
-        sync_directory(staging)
-        staging.rename(destination)
-        sync_directory(root / 'snapshots')
-        write_json(pointer, {'schema_version': SCHEMA_VERSION,
-                             'snapshot': 'snapshots/' + generation,
-                             'cards': 'snapshots/' + generation + '/cards',
-                             'manifest': 'snapshots/' + generation + '/manifest.json'})
-        # The only commit point. Every referenced file is already complete and durable.
-        os.replace(pointer, root / 'current.json')
-        sync_directory(root)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        pointer.unlink(missing_ok=True)
-    return manifest
+    ids = manifest['card_ids']
+    if (any(type(i) is not int or i <= 0 for i in ids)
+            or ids != sorted(set(ids))):
+        raise SyncError('Invalid local card IDs.')
+    cards = SnapshotCards(path / 'cards', ids)
+    return manifest, cards if lazy else dict(cards)
