@@ -123,6 +123,8 @@ def seed(client, process='Basic', count=24, team=None, board=None):
     for key, item in saved.items():
         card = keyed[key]
         fields = item['fields']
+        if type(item.get('rev')) is not int or item['rev'] < 1:
+            raise SyncError('Synthetic seed card revision is missing; refusing writes.')
         parent = card['parent_key']
         expected_parent = saved.get(parent, {}).get('id') if parent else None
         actual_parents = [r.get('url', '').rsplit('/', 1)[-1]
@@ -133,9 +135,10 @@ def seed(client, process='Basic', count=24, team=None, board=None):
                 or fields.get('System.IterationPath') != config['backlog_iteration']['path']
                 or actual_parents != ([str(expected_parent)] if expected_parent else [])):
             raise SyncError('Synthetic seed cards were edited or have inconsistent parents; refusing writes.')
-        if key in placed:
+        if card['column'] is not None:
             column_field = config['board']['fields']['columnField']['referenceName']
-            if fields.get(column_field) != card['column']:
+            allowed_columns = {card['column']} if key in placed else {None, '', card['column']}
+            if fields.get(column_field) not in allowed_columns:
                 raise SyncError('Synthetic seed card placement was edited; refusing writes.')
     created = 0
     for card in planned['cards']:
@@ -158,7 +161,8 @@ def seed(client, process='Basic', count=24, team=None, board=None):
             # Creation is never automatically retried: a timeout may hide a successful write.
             item = client.request('POST', client.project_route + '/_apis/wit/workitems/$'
                                   + segment(card['type']), body, patch=True, retry=False)
-            if type(item.get('id')) is not int:
+            if (type(item.get('id')) is not int or type(item.get('rev')) is not int
+                    or item['rev'] < 1):
                 raise SyncError('Seed create response was incomplete; rerun the same command.')
             saved[key] = item
             created += 1
@@ -171,7 +175,8 @@ def seed(client, process='Basic', count=24, team=None, board=None):
             # is recoverable, while later manual column moves are refused in preflight.
             # Older seed versions have no completion proof and are rejected above.
             client.request('PATCH', client.project_route + '/_apis/wit/workitems/' + str(item_id),
-                           [{'op': 'add', 'path': '/fields/' + column_field,
+                           [{'op': 'test', 'path': '/rev', 'value': saved[key]['rev']},
+                            {'op': 'add', 'path': '/fields/' + column_field,
                              'value': card['column']},
                             {'op': 'add', 'path': '/fields/System.Tags',
                              'value': '; '.join(card['tags'] + [PLACED_MARKER])}],

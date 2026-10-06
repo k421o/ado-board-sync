@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import subprocess
@@ -151,7 +152,92 @@ class SeedTests(unittest.TestCase):
             pending['fields'][COLUMN] = 'Done'
             fake.fail_path = None
             self.assertEqual(seed(self.client(url))['created'], 21)
-            self.assertIn(PLACED_MARKER, pending['fields']['System.Tags'].split('; '))
+            self.assertIn(PLACED_MARKER, fake.items[102]['fields']['System.Tags'].split('; '))
+
+    def test_pending_manual_move_refused_before_resume_writes(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.fail_path = '/workitems/103'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(len(fake.items), 4)
+            pending = fake.items[103]
+            self.assertNotIn(PLACED_MARKER, pending['fields']['System.Tags'])
+            self.assertEqual(pending['fields']['System.State'], 'Doing')
+            pending['fields'][COLUMN] = 'Review'
+            pending['rev'] += 1
+            before = copy.deepcopy(fake.items)
+            fake.fail_path = None
+            calls_before = len(fake.calls)
+            with self.assertRaisesRegex(SyncError, 'placement was edited'):
+                seed(self.client(url))
+            self.assertEqual(fake.items, before)
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
+
+    def test_pending_concurrent_edit_survives_revision_conflict(self):
+        fake = FakeADO()
+        fake.items = {}
+        fake.fail_path = '/workitems/103'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            read_revision = fake.items[103]['rev']
+            changed = {}
+
+            def manual_edit(data):
+                pending = data.items[103]
+                pending['fields'][COLUMN] = 'Review'
+                pending['fields']['System.Tags'] += '; manual-note'
+                pending['rev'] += 1
+                changed.update(copy.deepcopy(data.items))
+
+            fake.fail_path = None
+            fake.after_first_query = manual_edit
+            calls_before = len(fake.calls)
+            with self.assertRaisesRegex(SyncError, 'HTTP 412'):
+                seed(self.client(url))
+            self.assertEqual(fake.items, changed)
+            patches = [c for c in fake.calls[calls_before:] if c[0] == 'PATCH']
+            self.assertEqual(len(patches), 1)
+            self.assertEqual(patches[0][3][0], {'op': 'test', 'path': '/rev',
+                                              'value': read_revision})
+            self.assertFalse(any('/workitems/$' in c[1] for c in fake.calls[calls_before:]))
+
+    def test_fresh_create_concurrent_edit_survives_revision_conflict(self):
+        fake = FakeADO()
+        fake.items = {}
+        changed = {}
+
+        def manual_edit(data, item_id):
+            if item_id == 102:
+                created = data.items[item_id]
+                created['fields'][COLUMN] = 'Review'
+                created['fields']['System.Tags'] += '; manual-note'
+                created['rev'] += 1
+                changed.update(copy.deepcopy(data.items))
+
+        fake.after_create = manual_edit
+        with server(fake) as (_, url):
+            with self.assertRaisesRegex(SyncError, 'HTTP 412'):
+                seed(self.client(url))
+            self.assertEqual(fake.items, changed)
+            self.assertEqual(len(fake.items), 3)
+            patches = [c for c in fake.calls if c[0] == 'PATCH']
+            self.assertEqual(len(patches), 1)
+            self.assertEqual(patches[0][3][0], {'op': 'test', 'path': '/rev', 'value': 1})
+
+    def test_failed_patch_test_is_atomic_even_after_field_operations(self):
+        with server() as (fake, url):
+            before = copy.deepcopy(fake.items[1])
+            with self.assertRaisesRegex(SyncError, 'HTTP 412'):
+                self.client(url).request('PATCH', '/OrbitLab/_apis/wit/workitems/1',
+                                        [{'op': 'add', 'path': '/fields/' + COLUMN, 'value': 'Review'},
+                                         {'op': 'add', 'path': '/fields/System.Tags', 'value': 'overwrite'},
+                                         {'op': 'test', 'path': '/rev', 'value': before['rev'] + 1}],
+                                        patch=True, retry=False)
+            self.assertEqual(fake.items[1], before)
 
     def test_seed_rejects_existing_work_and_process_mismatch_before_writes(self):
         with server() as (fake, url):

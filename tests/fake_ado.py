@@ -37,6 +37,7 @@ class FakeADO:
         self.after_first_query = None
         self.ambiguous_create = False
         self.ambiguous_patch = False
+        self.after_create = None
         self.invalid_json = False
         self.truncate_body = False
         self.query_mode = None
@@ -143,16 +144,35 @@ class FakeADO:
                 **fields, 'System.WorkItemType': kind}, 'relations': relations}
             self.items[self.next_id] = copy.deepcopy(created)
             self.next_id += 1
+            if self.after_create:
+                self.after_create(self, created['id'])
             if self.ambiguous_create:
                 self.ambiguous_create = False
                 return 503, {'message': 'creation committed but response lost'}, {}
             return 200, created, {}
         if method == 'PATCH' and '/workitems/' in path:
             assert content_type == 'application/json-patch+json'
-            target = self.items[int(path.rsplit('/', 1)[-1])]
+            item_id = int(path.rsplit('/', 1)[-1])
+            target = copy.deepcopy(self.items[item_id])
             for op in body:
-                target['fields'][op['path'].removeprefix('/fields/')] = op['value']
+                if op['op'] == 'test':
+                    if op['path'] == '/rev':
+                        actual = target['rev']
+                    elif op['path'].startswith('/fields/'):
+                        field = op['path'].removeprefix('/fields/')
+                        if field not in target['fields']:
+                            return 412, {'message': 'patch precondition failed'}, {}
+                        actual = target['fields'][field]
+                    else:
+                        return 400, {'message': 'unsupported test path'}, {}
+                    if actual != op['value']:
+                        return 412, {'message': 'patch precondition failed'}, {}
+                elif op['op'] == 'add' and op['path'].startswith('/fields/'):
+                    target['fields'][op['path'].removeprefix('/fields/')] = op['value']
+                else:
+                    return 400, {'message': 'unsupported patch operation'}, {}
             target['rev'] += 1
+            self.items[item_id] = target
             if self.ambiguous_patch:
                 self.ambiguous_patch = False
                 return 503, {'message': 'placement committed but response lost'}, {}
