@@ -54,13 +54,31 @@ def configuration(client, route, board_id):
             raise ValueError()
         if not areas['values'] or any(not a['value'] for a in areas['values']):
             raise ValueError()
-        if not settings['backlogIteration']['path']:
+        iteration = settings['backlogIteration']
+        path = iteration['path']
+        if not isinstance(path, str):
             raise ValueError()
+        if not path or path.startswith('\\'):
+            # Team settings use project-relative paths, including '' for the root.
+            # Resolve the canonical project name even when --project is a GUID.
+            node_route = client.project_route + '/_apis/wit/classificationNodes/Iterations'
+            root = client.request('GET', node_route)
+            parts = path.lstrip('\\').split('\\') if path else []
+            if any(not part or part in {'.', '..'} for part in parts):
+                raise ValueError()
+            node = (client.request('GET', node_route + '/' + '/'.join(map(segment, parts)))
+                    if parts else root)
+            if (not isinstance(root.get('name'), str) or not root['name']
+                    or root.get('structureType') != 'iteration'
+                    or node.get('structureType') != 'iteration'
+                    or not iteration.get('id') or node.get('identifier') != iteration['id']):
+                raise ValueError()
+            iteration = {**iteration, 'path': '\\'.join([root['name'], *parts])}
     except (KeyError, TypeError, ValueError):
         raise SyncError('Board configuration is incomplete; refusing an unsafe export.') from None
     # Keep only membership/position configuration; unrelated settings need not abort a sync.
     return {'board': board, 'team_field_values': areas,
-            'backlog_iteration': settings['backlogIteration']}
+            'backlog_iteration': iteration}
 
 
 def membership_query(client, config):

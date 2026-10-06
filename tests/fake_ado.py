@@ -56,6 +56,8 @@ class FakeADO:
         self.areas = {'field': {'referenceName': 'System.AreaPath'}, 'defaultValue': 'OrbitLab',
                       'values': [{'value': 'OrbitLab', 'includeChildren': True}]}
         self.settings = {'backlogIteration': {'id': 'orbit-iteration', 'path': 'OrbitLab'}}
+        self.iteration_nodes = {'': {'identifier': 'orbit-iteration', 'name': 'OrbitLab',
+                                     'structureType': 'iteration'}}
         self.types = [{'name': kind, 'states': [{'name': state} for state in ('To Do', 'Doing', 'Done')]}
                       for kind in ('Epic', 'Issue', 'Task')]
 
@@ -67,6 +69,10 @@ class FakeADO:
         if self.invalid_json:
             return 200, b'not json invented-test-token', {}
         if method == 'GET':
+            if '/_apis/wit/classificationNodes/Iterations' in path:
+                relative = path.split('/classificationNodes/Iterations', 1)[1].lstrip('/')
+                node = self.iteration_nodes.get(relative)
+                return (200, node, {}) if node else (404, {'message': 'Unknown iteration'}, {})
             if '/_apis/projects/' in path:
                 return 200, {'defaultTeam': {'id': 'orbit-team'}}, {}
             if path.endswith('/boards'):

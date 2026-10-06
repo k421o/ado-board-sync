@@ -39,6 +39,7 @@ class SeedTests(unittest.TestCase):
     def test_seed_creates_then_reconciles_and_syncs(self):
         fake = FakeADO()
         fake.items = {}
+        fake.settings['backlogIteration']['path'] = ''
         with server(fake) as (_, url):
             result = seed(self.client(url))
             self.assertEqual(result['created'], 24)

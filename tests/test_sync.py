@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ado_board_sync.board import membership_query, read_items
+from ado_board_sync.board import configuration, membership_query, read_items
 from ado_board_sync.client import Client, SyncError
 from ado_board_sync.storage import current_snapshot, locked_folder
 from ado_board_sync.sync import sync
@@ -46,6 +46,32 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(third['changes']['unchanged'], 3)
             self.assertFalse(third['changes']['updated'])
             self.assertTrue(all(call[0] != 'PATCH' for call in fake.calls))
+
+    def test_project_relative_backlog_iteration_paths(self):
+        with server() as (fake, url):
+            fake.settings['backlogIteration']['path'] = ''
+            manifest = sync(self.client(url), self.root)
+            self.assertEqual(manifest['card_ids'], [1, 2, 3])
+            fake.settings['backlogIteration'] = {'id': 'nested-iteration',
+                                                 'path': '\\Release One\\Sprint 1'}
+            fake.iteration_nodes['Release One/Sprint 1'] = {
+                'identifier': 'nested-iteration', 'name': 'Sprint 1',
+                'structureType': 'iteration'}
+            client = Client('orbit-lab', 'synthetic-project-id', 'invented-test-token', url)
+            config = configuration(client, '/OrbitLab/orbit-team/_apis/work', 'orbit-board')
+            self.assertEqual(config['backlog_iteration']['path'],
+                             'OrbitLab\\Release One\\Sprint 1')
+            self.assertIn("UNDER 'OrbitLab\\Release One\\Sprint 1'", membership_query(client, config))
+
+    def test_changed_iteration_identity_preserves_snapshot(self):
+        with server() as (fake, url):
+            sync(self.client(url), self.root)
+            pointer = (self.root / 'current.json').read_bytes()
+            fake.settings['backlogIteration']['path'] = ''
+            fake.iteration_nodes['']['identifier'] = 'different-iteration'
+            with self.assertRaises(SyncError):
+                sync(self.client(url), self.root)
+            self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
 
     def test_failed_partial_or_changed_config_retains_previous_snapshot(self):
         with server() as (fake, url):
