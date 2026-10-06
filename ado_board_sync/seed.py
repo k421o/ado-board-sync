@@ -209,7 +209,7 @@ def seed(client, process='Basic', count=24, team=None, board=None):
                 column_field = config['board']['fields']['columnField']['referenceName']
                 body.append({'op': 'add', 'path': '/fields/' + column_field, 'value': card['column']})
             final_tags = card['tags'] + ([PLACED_MARKER] if card['column'] is not None else [])
-            body.append({'op': 'add', 'path': '/fields/System.Tags', 'value': '; '.join(final_tags)})
+            body.append({'op': 'replace', 'path': '/fields/System.Tags', 'value': '; '.join(final_tags)})
             client.request('PATCH', client.project_route + '/_apis/wit/workitems/' + str(item_id), body,
                            patch=True, retry=False)
     return {'created': created, 'total': len(saved), 'board': config['board']['name'],

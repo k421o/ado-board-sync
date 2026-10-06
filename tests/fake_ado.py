@@ -176,8 +176,13 @@ class FakeADO:
                         return 400, {'message': 'unsupported test path'}, {}
                     if actual != op['value']:
                         return 412, {'message': 'patch precondition failed'}, {}
-                elif op['op'] == 'add' and op['path'].startswith('/fields/'):
-                    target['fields'][op['path'].removeprefix('/fields/')] = op['value']
+                elif op['op'] in {'add', 'replace'} and op['path'].startswith('/fields/'):
+                    field = op['path'].removeprefix('/fields/')
+                    if field == 'System.Tags' and op['op'] == 'add':
+                        tags = target['fields'].get(field, '').split(';') + op['value'].split(';')
+                        target['fields'][field] = '; '.join(sorted({t.strip() for t in tags if t.strip()}))
+                    else:
+                        target['fields'][field] = op['value']
                 else:
                     return 400, {'message': 'unsupported patch operation'}, {}
             target['rev'] += 1
