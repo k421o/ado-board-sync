@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ado_board_sync.client import Client, SyncError
-from ado_board_sync.seed import PLACED_MARKER, PROCESSES, plan, seed
+from ado_board_sync.seed import PENDING_STATE_MARKER, PLACED_MARKER, PROCESSES, plan, seed
 from ado_board_sync.storage import current_snapshot
 from fake_ado import COLUMN, FakeADO, server
 
@@ -66,6 +66,80 @@ class SeedTests(unittest.TestCase):
                                  sum(c['type'] == 'Issue' for c in planned))
                 cards = current_snapshot(Path(directory))[1]
                 self.assertTrue(all(c['parent_ids'] for c in cards.values()))
+
+    def test_resume_accepts_server_paragraph_spacing_but_rejects_content_edits(self):
+        with server() as (fake, url):
+            fake.items = {}
+            seed(self.client(url))
+            for item in fake.items.values():
+                fields = item['fields']
+                fields['System.Description'] = fields['System.Description'].replace('</p>', ' </p>')
+            self.assertEqual(seed(self.client(url))['created'], 0)
+            fields['System.Description'] = fields['System.Description'].replace('Synthetic', 'Edited', 1)
+            calls_before = len(fake.calls)
+            with self.assertRaisesRegex(SyncError, 'edited'):
+                seed(self.client(url))
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
+
+    def restricted_create_fake(self):
+        fake = FakeADO()
+        fake.items = {}
+        for kind in fake.types:
+            kind['transitions'] = {'': [{'to': 'To Do'}],
+                                   'To Do': [{'to': 'Doing'}, {'to': 'Done'}]}
+        return fake
+
+    def test_state_transition_resume_and_repeat(self):
+        fake = self.restricted_create_fake()
+        fake.fail_path = '/workitems/104'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(len(fake.items), 5)
+            self.assertEqual(fake.items[104]['fields']['System.State'], 'To Do')
+            self.assertIn(PENDING_STATE_MARKER, fake.items[104]['fields']['System.Tags'])
+            fake.fail_path = None
+            result = seed(self.client(url))
+            self.assertEqual(result['created'], 19)
+            for card, saved in zip(plan()['cards'], result['cards']):
+                fields = fake.items[saved['id']]['fields']
+                self.assertEqual(fields['System.State'], card['state'])
+                self.assertNotIn(PENDING_STATE_MARKER, fields['System.Tags'])
+            self.assertEqual(seed(self.client(url))['created'], 0)
+
+    def test_lost_state_transition_response_recovers(self):
+        fake = self.restricted_create_fake()
+        fake.ambiguous_patch = True
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            self.assertEqual(fake.items[100]['fields']['System.State'], 'Doing')
+            self.assertEqual(seed(self.client(url))['created'], 23)
+
+    def test_pending_task_transition_preserves_manual_edits(self):
+        fake = self.restricted_create_fake()
+        fake.fail_path = '/workitems/104'
+        with server(fake) as (_, url):
+            with self.assertRaises(SyncError):
+                seed(self.client(url))
+            fake.fail_path = None
+            changed = {}
+
+            def edit_task(data):
+                data.items[104]['fields']['System.Tags'] += '; manual-note'
+                data.items[104]['rev'] += 1
+                changed.update(copy.deepcopy(data.items))
+
+            fake.after_first_query = edit_task
+            with self.assertRaisesRegex(SyncError, 'HTTP 412'):
+                seed(self.client(url))
+            self.assertEqual(fake.items, changed)
+            calls_before = len(fake.calls)
+            with self.assertRaisesRegex(SyncError, 'edited'):
+                seed(self.client(url))
+            self.assertFalse(any(c[0] == 'PATCH' or '/workitems/$' in c[1]
+                                 for c in fake.calls[calls_before:]))
 
     def test_ambiguous_creation_is_not_retried_and_resume_does_not_duplicate(self):
         fake = FakeADO()

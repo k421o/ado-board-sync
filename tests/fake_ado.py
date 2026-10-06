@@ -142,6 +142,9 @@ class FakeADO:
                       for op in body if op['path'].startswith('/fields/')}
             states = next(t['states'] for t in self.types if t['name'] == kind)
             assert fields['System.State'] in {s['name'] for s in states}
+            transitions = next(t.get('transitions', {}) for t in self.types if t['name'] == kind)
+            if transitions.get('') and fields['System.State'] not in {t['to'] for t in transitions['']}:
+                return 400, {'message': 'State cannot be used at creation'}, {}
             assert 'System.AssignedTo' not in fields  # invented personas are not ADO identities
             relations = [op['value'] for op in body if op['path'] == '/relations/-']
             for relation in relations:
