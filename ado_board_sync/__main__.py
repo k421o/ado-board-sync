@@ -3,6 +3,7 @@ import json
 import sys
 
 from .client import Client, SyncError, credentials
+from .hierarchy import text_tree
 from .local import Filters, LocalSnapshot
 from .seed import PROCESSES, plan, seed
 from .sync import sync
@@ -13,11 +14,22 @@ def parser():
     commands = root.add_subparsers(dest='command', required=True)
     for name, help_text in [('list', 'Filter and page through local card summaries.'),
                             ('show', 'Read one complete local card.'),
+                            ('tree', 'Build the full local parent/child hierarchy across all types.'),
                             ('stats', 'Count local cards by state, type, assignee and tag.'),
                             ('bundle', 'Package matching cards for an agent, separate from sync data.')]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument('--data', default='board-data', help='Existing sync output folder; no auth needed.')
         command.add_argument('--snapshot', help='Pin a returned snapshots/<generation> path across pages.')
+        if name == 'tree':
+            selection = command.add_mutually_exclusive_group()
+            selection.add_argument('--root', type=int, help='Show this item and all its descendants.')
+            selection.add_argument('--path', type=int, help='Show the full ancestor chain ending at this item.')
+            command.add_argument('--format', choices=('json', 'text'), default='json',
+                                 help='JSON nodes with parent/child IDs and depth (default), or indented text.')
+            command.epilog = ('Uses recorded links, not fixed type names. Missing items are placeholders; '
+                              'cycles/conflicting parents fail. Includes every node without pagination. '
+                              'Use a project-scope sync for the broadest available hierarchy.')
+            continue
         if name == 'show':
             command.add_argument('id', type=int, help='Work item ID.')
             continue
@@ -67,9 +79,11 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if args.command in {'list', 'show', 'stats', 'bundle'}:
+        if args.command in {'list', 'show', 'stats', 'bundle', 'tree'}:
             snapshot = LocalSnapshot(args.data, args.snapshot)
-            if args.command == 'show':
+            if args.command == 'tree':
+                result = snapshot.tree(root=args.root, path=args.path)
+            elif args.command == 'show':
                 result = snapshot.show(args.id)
             else:
                 filters = Filters(ids=args.id, states=args.state, types=args.type,
@@ -99,7 +113,14 @@ def main(argv=None):
                           'read_first': args.output.rstrip('/\\') + '/current.json'}
             else:
                 result = seed(client, args.process, args.count, args.team, args.board)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if args.command == 'tree' and args.format == 'text':
+            for line in text_tree(result):
+                print(line)
+        elif args.command == 'tree':
+            json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
+            print()
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except SyncError as error:
         print('error: ' + str(error), file=sys.stderr)

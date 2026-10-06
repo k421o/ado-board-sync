@@ -99,10 +99,22 @@ def local_worker(output, count):
         bundle = local.bundle(Path(directory) / 'work', filters, limit=50)
         assert bundle['card_ids'] == expected[:50]
     assert local.show(count * 3)['card']['fields'] == synthetic(count * 3)['fields']
+    started = time.monotonic()
+    tree = local.tree()
+    tree_seconds = time.monotonic() - started
+    assert tree['card_count'] == count and tree['missing_ids'] == []
+    assert tree['root_ids'] == [3] and tree['max_depth'] == count - 1
+    assert [node['id'] for node in tree['nodes']] == list(range(3, count * 3 + 1, 3))
+    assert tree['nodes'][-1]['parent_id'] == (count - 1) * 3
+    # Exercise full JSON output for a chain far beyond Python's recursion limit.
+    with tempfile.TemporaryDirectory(prefix='ado-tree-scale-') as directory:
+        with (Path(directory) / 'tree.json').open('w', encoding='utf-8') as stream:
+            json.dump(tree, stream, indent=2, ensure_ascii=False)
     print(json.dumps({'items': count, 'phase': 'local_queries', 'traffic': 'none',
                       'stats_seconds': round(stats_seconds, 3),
                       'filter_all_pages_seconds': round(filter_seconds, 3),
                       'filtered_count': len(seen), 'bundle_count': len(bundle['card_ids']),
+                      'tree_seconds': round(tree_seconds, 3), 'tree_depth': tree['max_depth'],
                       'peak_rss_mib': peak_rss()}))
 
 

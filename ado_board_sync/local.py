@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import SCHEMA_VERSION
 from .client import SyncError
+from .hierarchy import build_tree
 from .storage import current_snapshot, ignore_export, sync_directory, write_json
 
 
@@ -164,6 +165,9 @@ class LocalSnapshot:
     def show(self, item_id):
         return {**self.metadata(), 'enrichment': self.manifest.get('enrichment', {}),
                 'card': self.card(item_id)}
+
+    def tree(self, *, root=None, path=None):
+        return build_tree(self, root=root, path=path)
 
     def stats(self, filters):
         groups = {name: Counter() for name in ('state', 'type', 'assignee', 'tag')}
