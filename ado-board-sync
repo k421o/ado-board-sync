@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ado_board_sync "$@"
