@@ -3,10 +3,8 @@
 import json
 import os
 import re
-import shutil
-import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import SCHEMA_VERSION
@@ -67,7 +65,25 @@ def locked_folder(output):
         lock.unlink()
 
 
-def current_snapshot(root):
+class SnapshotCards(Mapping):
+    """Read one previous card at a time instead of retaining its contents."""
+
+    def __init__(self, folder, ids):
+        self.folder, self.ids = folder, set(ids)
+
+    def __iter__(self):
+        return iter(self.ids)
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, item_id):
+        if item_id not in self.ids:
+            raise KeyError(item_id)
+        return load_json(self.folder / f"{item_id}.json")
+
+
+def current_snapshot(root, *, lazy=False):
     pointer = root / 'current.json'
     if not pointer.exists():
         return None, {}
@@ -84,48 +100,9 @@ def current_snapshot(root):
             or not isinstance(manifest.get('card_ids'), list)
             or manifest.get('card_count') != len(manifest['card_ids'])):
         raise SyncError('Invalid local snapshot manifest.')
-    cards = {}
-    for item_id in manifest['card_ids']:
-        if type(item_id) is not int or item_id <= 0:
-            raise SyncError('Invalid local card ID.')
-        cards[item_id] = load_json(path / 'cards' / f'{item_id}.json')
-    return manifest, cards
-
-
-def publish(root, source, config, cards, as_of, previous):
-    generation = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex
-    staging = root / 'snapshots' / ('.tmp-' + generation)
-    destination = root / 'snapshots' / generation
-    pointer = root / ('.current-' + generation)
-    new = {card['id']: card for card in cards}
-    changed = sorted(i for i in new.keys() & previous.keys() if new[i] != previous[i])
-    changes = {'added': sorted(new.keys() - previous.keys()), 'updated': changed,
-               'moved': [i for i in changed if any(new[i][key] != previous[i][key]
-                                                   for key in ('column', 'column_done', 'lane'))],
-               'removed': sorted(previous.keys() - new.keys()),
-               'unchanged': len(new.keys() & previous.keys()) - len(changed)}
-    manifest = {'schema_version': SCHEMA_VERSION, 'source': source, 'as_of': as_of,
-                'synced_at': datetime.now(timezone.utc).isoformat(),
-                'card_ids': sorted(new), 'card_count': len(new), 'changes': changes,
-                'configuration': config}
-    try:
-        (staging / 'cards').mkdir(parents=True)
-        for item_id, card in new.items():
-            write_json(staging / 'cards' / f'{item_id}.json', card)
-        write_json(staging / 'manifest.json', manifest)
-        sync_directory(staging / 'cards')
-        sync_directory(staging)
-        staging.rename(destination)
-        sync_directory(root / 'snapshots')
-        write_json(pointer, {'schema_version': SCHEMA_VERSION,
-                             'snapshot': 'snapshots/' + generation,
-                             'cards': 'snapshots/' + generation + '/cards',
-                             'manifest': 'snapshots/' + generation + '/manifest.json'})
-        # The only commit point. Every referenced file is already complete and durable.
-        os.replace(pointer, root / 'current.json')
-        sync_directory(root)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        pointer.unlink(missing_ok=True)
-    return manifest
+    ids = manifest['card_ids']
+    if (any(type(i) is not int or i <= 0 for i in ids)
+            or ids != sorted(set(ids))):
+        raise SyncError('Invalid local card IDs.')
+    cards = SnapshotCards(path / 'cards', ids)
+    return manifest, cards if lazy else dict(cards)

@@ -41,6 +41,7 @@ class FakeADO:
         self.invalid_json = False
         self.truncate_body = False
         self.query_mode = None
+        self.response_headers = {}
         self.next_id = 100
         self.board = {'id': 'orbit-board', 'name': 'Issues', 'isValid': True, 'revision': 1,
                       'fields': {'columnField': {'referenceName': COLUMN},
@@ -226,7 +227,7 @@ def server(fake=None):
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(encoded) + (10 if fake.truncate_body else 0)))
-            for key, value in headers.items():
+            for key, value in {**fake.response_headers, **headers}.items():
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(encoded)

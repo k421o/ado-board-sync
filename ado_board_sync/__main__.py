@@ -8,9 +8,9 @@ from .sync import sync
 
 
 def parser():
-    root = argparse.ArgumentParser(description='Sync an Azure DevOps Kanban board into local JSON cards.')
+    root = argparse.ArgumentParser(description='Sync Azure DevOps work items into local JSON cards.')
     commands = root.add_subparsers(dest='command', required=True)
-    for name, help_text in [('sync', 'Read a board into an atomic local snapshot.'),
+    for name, help_text in [('sync', 'Read a project into an atomic local snapshot.'),
                             ('seed', 'Fill an empty sandbox project with invented cards.')]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument('--organization', required=True, help='Organization short name, not a URL.')
@@ -22,6 +22,11 @@ def parser():
         command.add_argument('--timeout', type=float, default=30, help='Request timeout in seconds (1–300).')
         if name == 'sync':
             command.add_argument('--output', default='board-data', help='Dedicated local folder.')
+            command.add_argument('--scope', choices=('project', 'board'), default='project',
+                                 help='All accessible project items (default), or one board.')
+            command.add_argument('--resume', action='store_true',
+                                 help='Continue a matching interrupted export at its original timestamp.')
+            command.add_argument('--progress', action='store_true', help='Print batch progress to stderr.')
         else:
             command.add_argument('--process', choices=tuple(PROCESSES), default='Basic')
             command.add_argument('--count', type=int, default=24, help='Total synthetic cards (12–500).')
@@ -40,7 +45,10 @@ def main(argv=None):
             client = Client(args.organization, args.project,
                             credentials(args.auth, args.organization), args.base_url, args.timeout)
             if args.command == 'sync':
-                manifest = sync(client, args.output, args.team, args.board)
+                progress = ((lambda count: print(f'Fetched {count} work items', file=sys.stderr))
+                            if args.progress else None)
+                manifest = sync(client, args.output, args.team, args.board, scope=args.scope,
+                                resume=args.resume, progress=progress)
                 result = {'card_count': manifest['card_count'], 'as_of': manifest['as_of'],
                           'changes': manifest['changes'], 'output': args.output,
                           'read_first': args.output.rstrip('/\\') + '/current.json'}

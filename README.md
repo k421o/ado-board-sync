@@ -1,7 +1,8 @@
 # ado-board-sync
 
-Read an Azure DevOps Kanban board into a folder of JSON cards. Run the same
-command again to pick up additions, edits, column/lane moves and removals.
+Read every accessible work item in an Azure DevOps project into local JSON cards.
+Custom types, states and fields need no configuration. Run the same command again
+to pick up additions, edits and removals, or select an individual board explicitly.
 The sync command only reads Azure DevOps. A separate seed command creates
 invented cards in an empty sandbox project.
 
@@ -35,11 +36,11 @@ also needs access to the project and its work items:
 | --- | --- |
 | `sync` | Work Items: **Read** (`vso.work`) |
 | `seed` | Work Items: **Read & write** (`vso.work_write`, includes read) |
-| Either command without `--team` | Also Project and Team: **Read** (`vso.project`) and User Profile: **Read** (`vso.profile`) for default-team discovery |
+| `seed` or `sync --scope board`, without `--team` | Also Project and Team: **Read** (`vso.project`) and User Profile: **Read** (`vso.profile`) for default-team discovery |
 | `seed --dry-run` | None; no credentials or network calls |
 
-Passing `--team` skips the project-discovery API and needs only the Work Items
-scope. Neither command needs project creation, user management, code, build or
+Default project sync needs only Work Items: Read. For board sync or seed, passing
+`--team` skips the project-discovery API and needs only the Work Items scope. Neither command needs project creation, user management, code, build or
 full-access scopes. The REST scopes follow the official
 [Work API](https://github.com/MicrosoftDocs/vsts-rest-api-specs/blob/master/specification/work/7.1/work.json),
 [Work Item Tracking API](https://github.com/MicrosoftDocs/vsts-rest-api-specs/blob/master/specification/wit/7.1/workItemTracking.json)
@@ -60,13 +61,14 @@ unset ADO_PAT
 
 Replace the organization and project with your own. The organization is its
 short name, not its URL. Project and team arguments accept names or IDs. The
-default selection is the project's default team and its requirement-level
-board (for example, Issues in Basic or Stories in Agile). To select a different
-team or a portfolio board:
+default scope is the entire project: all accessible types, states, areas and
+iterations, including Epics and Tasks. Board settings are not queried. To export
+a specific board, use `--scope board` (the default team/requirement board is used
+if team and board are omitted):
 
 ```sh
 ./ado-board-sync sync --organization orbit-grove --project OrbitLab \
-  --team 'Starlight Team' --board 'Issues' --output ./board-data
+  --scope board --team 'Starlight Team' --board 'Issues' --output ./one-board-data
 ```
 
 Inject `ADO_PAT` again before subsequent commands, or have your secret manager
@@ -75,7 +77,9 @@ Do not put a PAT in a command argument, file, `.env`, README or exported card.
 The client holds credentials in memory, refuses redirects, and omits server
 error bodies from diagnostics. `--timeout 60` increases each request's timeout
 from the default 30 seconds. Read requests have bounded retries for transient
-network errors and throttling.
+network errors and throttling. Server `Retry-After` delays are honored, including
+on successful responses. `--progress` prints the retrieved count to stderr while
+the final JSON summary remains on stdout.
 
 On macOS, Keychain can supply the PAT without an environment variable: use
 Keychain Access to create a generic password item with name/service
@@ -106,8 +110,10 @@ from pathlib import Path
 root = Path("board-data")
 pointer = json.loads((root / "current.json").read_text(encoding="utf-8"))
 manifest = json.loads((root / pointer["manifest"]).read_text(encoding="utf-8"))
-cards = [json.loads((root / pointer["cards"] / f"{i}.json").read_text(encoding="utf-8"))
-         for i in manifest["card_ids"]]
+cards = (json.loads((root / pointer["cards"] / f"{i}.json").read_text(encoding="utf-8"))
+         for i in manifest["card_ids"])
+for card in cards:
+    print(card["id"], card["title"])
 ```
 
 Each `<id>.json` contains the stable work item ID and revision, title, type,
@@ -115,40 +121,56 @@ state, selected team's column, split-column done flag, lane, assignee identity,
 area/iteration paths, description, parent IDs, raw fields and relations.
 Descriptions retain ADO's HTML. Raw data preserves custom fields and links for
 later comparison or publishing tools. Parent links may point to cards on a
-different board; only the selected board's cards are exported. Comments,
-attachments and revision history are not fetched in this round.
+different project. Project exports preserve all returned fields and relations,
+but leave interpreted column/lane/done values null because no team board is
+selected. The manifest labels comments and revision history `not_fetched`, and
+attachments `links_only`; attachment contents are not downloaded.
 
-The manifest records the source, board configuration, server `as_of` time,
-card IDs and changes since the previous successful sync. Membership uses the
-team's area scope, backlog iteration and the board's type/state mappings.
+The manifest records the source, scope/configuration, server `as_of` time,
+card IDs and changes since the previous successful sync. With `--scope board`,
+membership uses the team's area scope, backlog iteration and the board's
+type/state mappings.
 This includes completed cards and ignores temporary browser search, assignee
 and date filters; it exports the accessible board membership rather than a
 screenshot of the current web view. Cards deleted, moved outside that scope,
 or moved to a state absent from the board disappear from the new snapshot.
-Positions use the selected team's board-specific fields, not another team's
+In board mode, positions use the selected team's board-specific fields, not another team's
 global column. Newly created cards without those fields use their state’s
 first mapped column until ADO supplies a position.
 
 ## Failure and recovery
 
 All pages and batches use one server timestamp. Missing items, invalid data,
-HTTP failures or a board-configuration change abort publication. Files are
-written into a new immutable generation; only after it is complete does
+HTTP failures or (in board mode) a configuration change abort publication. IDs
+are queried in pages of 1,000, then complete details in batches of at most 200.
+Each batch is written to `.in-progress` before advancing an atomic checkpoint.
+Card contents are not accumulated in memory; comparison loads previous cards
+one at a time. ID lists and manifest metadata still scale with the item count.
+Completed files become a new immutable generation; only after it is complete does
 `current.json` switch atomically. An interrupted or failed run leaves the
 last published cards readable. An initial failed run has no `current.json`.
 Concurrent writers are refused by `.sync-lock`.
 
-Keep using the last pointer after a failure and rerun the same command. After
-a process is forcibly killed, verify that no sync is running before removing
+Keep using the last pointer after a failure. Rerun with `--resume` to continue
+a matching incomplete export at the original server timestamp, without
+refetching committed batches. Files from an interrupted, uncommitted batch are
+discarded. Rerun without `--resume` to discard incomplete staging and take a
+fresh snapshot. Source/configuration mismatches and missing committed files
+refuse resume. A successful resumed export describes its original timestamp,
+not changes made during the interruption; run a fresh sync afterward if needed.
+
+After a process is forcibly killed, verify that no sync is running before removing
 `board-data/.sync-lock`. Complete older generations remain available for
 readers and recovery; delete unneeded generations manually only after readers
 finish, keeping the generation named in `current.json`. A crash may also leave
-an unreferenced generation or `.tmp-*` folder, which can be removed at that time.
+an unreferenced generation, which can be removed at that time.
 Do not recursively read every generation as the current board: older folders
 intentionally contain cards that have since been removed.
 
 Use a dedicated empty output folder. The tool refuses unrelated folders and
-refuses to repoint an existing snapshot folder to another source. Local edits
+refuses to repoint an existing snapshot folder to another source or scope.
+Existing board snapshots require `--scope board`; use a new output directory
+when switching to project scope. Local edits
 to a generation are not published to ADO; the next successful sync writes a
 fresh generation from the board. Store any agent notes outside snapshot
 generations. Keep the local data in your own environment; it can contain
@@ -199,10 +221,19 @@ bound to `127.0.0.1`; it needs no ADO account, token, dependency install or
 external network. Tests cover the command-line workflow, repeated sync,
 team-specific positions, scope removals, historical paging beyond 1,000 cards,
 200-item batches, failed/partial transfer and disk publication, output guards,
-all four seed processes and interrupted-seed recovery. The test servers and
+all four seed processes, interrupted-seed recovery, project exports, checkpoint
+resume, and pacing successful throttled responses. The test servers and
 temporary output folders are torn down after each test.
 
 `--base-url http://127.0.0.1:PORT` is available for a localhost fake server;
 it cannot redirect the client to a remote test host. Live commands normally
 use `https://dev.azure.com/<organization>` with REST API version 7.1. Live ADO
 integration and publication review are separate from this offline proof.
+
+Run the separate scale benchmark with `python3 scripts/check-scale.py`. It exports
+10,000 and 50,000 generated items twice through a localhost HTTP server, checking
+exact IDs, custom fields, relationships, request counts and unchanged detection.
+It reports elapsed time and exporter peak RSS (where supported) from separate
+processes; server memory is excluded. Temporary data is removed on completion.
+Use `--counts 100000` for a larger local run. This measures local throughput and
+memory, not real ADO query cost, network latency or workplace access policies.

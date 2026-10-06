@@ -61,7 +61,7 @@ class SeedTests(unittest.TestCase):
             self.assertEqual(again['cards'], result['cards'])
             with tempfile.TemporaryDirectory() as directory:
                 from ado_board_sync.sync import sync
-                manifest = sync(self.client(url), directory)
+                manifest = sync(self.client(url), directory, scope='board')
                 self.assertEqual(manifest['card_count'],
                                  sum(c['type'] == 'Issue' for c in planned))
                 cards = current_snapshot(Path(directory))[1]

@@ -24,8 +24,19 @@ class ClientTests(unittest.TestCase):
                 Client('orbit-lab', 'OrbitLab', 'invented', url)
 
     def test_retry_bounded(self):
-        self.assertEqual(retry_delay('999', 0), 30)
+        self.assertEqual(retry_delay('999', 0), 999)
         self.assertEqual(retry_delay('invalid', 1), 2)
+        self.assertEqual(retry_delay('inf', 1), 2)
+
+    def test_successful_response_paces_next_request(self):
+        with server() as (fake, url), patch('ado_board_sync.client.time.sleep') as sleep:
+            with patch('ado_board_sync.client.time.monotonic', return_value=100):
+                fake.response_headers = {'Retry-After': '65'}
+                client = Client('orbit-lab', 'OrbitLab', 'invented-test-token', url)
+                client.request('GET', '/_apis/projects/OrbitLab')
+                sleep.assert_not_called()
+                client.request('GET', '/_apis/projects/OrbitLab')
+                sleep.assert_called_once_with(65)
 
     def test_keychain_token_stays_in_memory(self):
         with patch('ado_board_sync.client.sys.platform', 'darwin'):
