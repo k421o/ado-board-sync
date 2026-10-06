@@ -105,8 +105,16 @@ class ProjectSyncTests(unittest.TestCase):
             self.assertEqual(sync(self.client(url), self.root)['card_count'], 404)
 
     def test_checkpoint_failure_does_not_skip_uncommitted_batch(self):
+        from ado_board_sync.export import os
+        replace = os.replace
+
+        def fail_checkpoint(source, destination):
+            if destination.name == 'checkpoint.json':
+                raise OSError('checkpoint failed')
+            return replace(source, destination)
+
         with server() as (_, url):
-            with patch('ado_board_sync.export.os.replace', side_effect=OSError('checkpoint failed')):
+            with patch('ado_board_sync.export.os.replace', side_effect=fail_checkpoint):
                 with self.assertRaises(OSError):
                     sync(self.client(url), self.root)
             checkpoint = json.loads((self.root / '.in-progress/checkpoint.json').read_text())

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import tempfile
 from contextlib import contextmanager
 from collections.abc import Mapping
 from pathlib import Path
@@ -35,6 +36,29 @@ def sync_directory(path):
             os.close(descriptor)
 
 
+def ignore_export(root):
+    """Exclude all generated data, even in a custom output folder inside a repo."""
+    path = root / '.gitignore'
+    contents = '# Generated ADO data may contain private work items.\n*\n'
+    if path.is_symlink():
+        raise SyncError('Export .gitignore must not be a symlink.')
+    if path.exists() and path.read_text(encoding='utf-8') == contents:
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                         prefix='.gitignore-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(root)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 @contextmanager
 def locked_folder(output):
     root = Path(output).absolute()
@@ -56,6 +80,7 @@ def locked_folder(output):
             write_json(marker, {'schema_version': SCHEMA_VERSION})
         elif load_json(marker) != {'schema_version': SCHEMA_VERSION}:
             raise SyncError('Unsupported snapshot folder format.')
+        ignore_export(root)
         snapshots = root / 'snapshots'
         if snapshots.is_symlink():
             raise SyncError('Snapshots directory must not be a symlink.')
