@@ -3,6 +3,7 @@ import json
 import sys
 
 from .client import Client, SyncError, credentials
+from .local import Filters, LocalSnapshot
 from .seed import PROCESSES, plan, seed
 from .sync import sync
 
@@ -10,6 +11,35 @@ from .sync import sync
 def parser():
     root = argparse.ArgumentParser(description='Sync Azure DevOps work items into local JSON cards.')
     commands = root.add_subparsers(dest='command', required=True)
+    for name, help_text in [('list', 'Filter and page through local card summaries.'),
+                            ('show', 'Read one complete local card.'),
+                            ('stats', 'Count local cards by state, type, assignee and tag.'),
+                            ('bundle', 'Package matching cards for an agent, separate from sync data.')]:
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument('--data', default='board-data', help='Existing sync output folder; no auth needed.')
+        command.add_argument('--snapshot', help='Pin a returned snapshots/<generation> path across pages.')
+        if name == 'show':
+            command.add_argument('id', type=int, help='Work item ID.')
+            continue
+        command.add_argument('--id', type=int, action='append', default=[], help='Exact ID; repeatable.')
+        command.add_argument('--state', action='append', default=[], help='Exact state; repeatable, case-insensitive.')
+        command.add_argument('--type', action='append', default=[], help='Exact work item type; repeatable.')
+        owner = command.add_mutually_exclusive_group()
+        owner.add_argument('--assignee', action='append', default=[], help='Exact name, email or identity ID; repeatable.')
+        owner.add_argument('--unassigned', action='store_true')
+        command.add_argument('--tag', action='append', default=[], help='Exact tag; repeatable.')
+        command.add_argument('--area', action='append', default=[], help='Area path including descendants; repeatable.')
+        command.add_argument('--iteration', action='append', default=[], help='Iteration path including descendants; repeatable.')
+        command.add_argument('--text', help='Case-insensitive text in title or HTML-decoded description.')
+        command.add_argument('--field', action='append', default=[], metavar='REFERENCE=VALUE',
+                             help='Exact raw field match; JSON value or unquoted text. Repeatable.')
+        command.epilog = ('Different filters combine with AND. Repeated values for one filter or field '
+                          'combine with OR. Names/tags/paths ignore case; raw fields use exact JSON values.')
+        if name in {'list', 'bundle'}:
+            command.add_argument('--limit', type=int, default=50, help='Maximum cards (1–1000; default 50).')
+            command.add_argument('--after-id', type=int, default=0, help='Continue after this ID; use --snapshot to pin results.')
+        if name == 'bundle':
+            command.add_argument('--output', required=True, help='New agent folder outside the sync output; Git-ignored automatically.')
     for name, help_text in [('sync', 'Read a project into an atomic local snapshot.'),
                             ('seed', 'Fill an empty sandbox project with invented cards.')]:
         command = commands.add_parser(name, help=help_text)
@@ -37,9 +67,24 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if not 1 <= args.timeout <= 300:
+        if args.command in {'list', 'show', 'stats', 'bundle'}:
+            snapshot = LocalSnapshot(args.data, args.snapshot)
+            if args.command == 'show':
+                result = snapshot.show(args.id)
+            else:
+                filters = Filters(ids=args.id, states=args.state, types=args.type,
+                                  assignees=args.assignee, unassigned=args.unassigned,
+                                  tag_values=args.tag, areas=args.area, iterations=args.iteration,
+                                  text=args.text, fields=args.field)
+                if args.command == 'stats':
+                    result = snapshot.stats(filters)
+                elif args.command == 'list':
+                    result = snapshot.listing(filters, args.limit, args.after_id)
+                else:
+                    result = snapshot.bundle(args.output, filters, args.limit, args.after_id)
+        elif not 1 <= args.timeout <= 300:
             raise SyncError('--timeout must be between 1 and 300 seconds.')
-        if args.command == 'seed' and args.dry_run:
+        elif args.command == 'seed' and args.dry_run:
             result = plan(args.process, args.count)
         else:
             client = Client(args.organization, args.project,

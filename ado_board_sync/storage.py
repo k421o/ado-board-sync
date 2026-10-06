@@ -108,11 +108,14 @@ class SnapshotCards(Mapping):
         return load_json(self.folder / f"{item_id}.json")
 
 
-def current_snapshot(root, *, lazy=False):
+def current_snapshot(root, *, lazy=False, snapshot=None):
     pointer = root / 'current.json'
-    if not pointer.exists():
-        return None, {}
-    data = load_json(pointer)
+    if snapshot is None:
+        if not pointer.exists():
+            return None, {}
+        data = load_json(pointer)
+    else:
+        data = {'schema_version': SCHEMA_VERSION, 'snapshot': snapshot}
     snapshot = data.get('snapshot', '')
     if (data.get('schema_version') != SCHEMA_VERSION or not isinstance(snapshot, str)
             or not re.fullmatch(r'snapshots/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}', snapshot)):

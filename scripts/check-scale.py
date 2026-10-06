@@ -14,6 +14,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / 'tests')]
 
 from ado_board_sync.client import Client
+from ado_board_sync.local import Filters, LocalSnapshot
 from ado_board_sync.storage import current_snapshot
 from ado_board_sync.sync import sync
 from fake_ado import FakeADO, item, server
@@ -66,6 +67,45 @@ class ScaleADO(FakeADO):
         raise AssertionError('Unexpected endpoint')
 
 
+def peak_rss():
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(peak / (1024 * 1024 if sys.platform == 'darwin' else 1024), 2)
+    except ImportError:
+        return None
+
+
+def local_worker(output, count):
+    started = time.monotonic()
+    local = LocalSnapshot(output)
+    result = local.stats(Filters())
+    assert result['matched_count'] == count
+    assert sum(result['counts']['type'].values()) == count
+    stats_seconds = time.monotonic() - started
+    started = time.monotonic()
+    filters = Filters(types=['Custom Approval'])
+    expected = [i for i in range(3, count * 3 + 1, 3) if i % 4 == 3]
+    seen, after = [], 0
+    while True:
+        page = local.listing(filters, limit=1000, after_id=after)
+        seen.extend(card['id'] for card in page['cards'])
+        if not page['has_more']:
+            break
+        after = page['next_after_id']
+    assert seen == expected
+    filter_seconds = time.monotonic() - started
+    with tempfile.TemporaryDirectory(prefix='ado-agent-scale-') as directory:
+        bundle = local.bundle(Path(directory) / 'work', filters, limit=50)
+        assert bundle['card_ids'] == expected[:50]
+    assert local.show(count * 3)['card']['fields'] == synthetic(count * 3)['fields']
+    print(json.dumps({'items': count, 'phase': 'local_queries', 'traffic': 'none',
+                      'stats_seconds': round(stats_seconds, 3),
+                      'filter_all_pages_seconds': round(filter_seconds, 3),
+                      'filtered_count': len(seen), 'bundle_count': len(bundle['card_ids']),
+                      'peak_rss_mib': peak_rss()}))
+
+
 def worker(url, output, count):
     started = time.monotonic()
     manifest = sync(Client('orbit-lab', 'OrbitLab', 'invented-test-token', url), output)
@@ -75,14 +115,8 @@ def worker(url, output, count):
     for item_id in (3, (count // 2) * 3, count * 3):
         assert cards[item_id]['fields'] == synthetic(item_id)['fields']
         assert cards[item_id]['relations'] == synthetic(item_id)['relations']
-    try:
-        import resource
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        peak_mib = peak / (1024 * 1024 if sys.platform == 'darwin' else 1024)
-    except ImportError:
-        peak_mib = None
     print(json.dumps({'items': count, 'seconds': round(elapsed, 3),
-                      'peak_rss_mib': round(peak_mib, 2) if peak_mib is not None else None,
+                      'peak_rss_mib': peak_rss(),
                       'added': len(manifest['changes']['added']),
                       'unchanged': manifest['changes']['unchanged']}))
 
@@ -91,11 +125,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--counts', type=int, nargs='+', default=[10000, 50000])
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--local-worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--url', help=argparse.SUPPRESS)
     parser.add_argument('--output', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if any(count < 2 for count in args.counts):
         parser.error('counts must be at least 2')
+    if args.local_worker:
+        local_worker(args.output, args.counts[0])
+        return
     if args.worker:
         worker(args.url, args.output, args.counts[0])
         return
@@ -116,6 +154,11 @@ def main():
                 assert result['added' if phase == 'first' else 'unchanged'] == count
                 print(json.dumps({**result, 'phase': phase, 'id_queries': queries,
                                   'detail_batches': batches, 'traffic': 'localhost_only'}), flush=True)
+            child = subprocess.run([sys.executable, __file__, '--local-worker', '--counts', str(count),
+                                    '--output', directory], capture_output=True, text=True, timeout=600)
+            if child.returncode:
+                raise RuntimeError(child.stderr)
+            print(child.stdout.strip(), flush=True)
 
 
 if __name__ == '__main__':
